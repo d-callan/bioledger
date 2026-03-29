@@ -1,5 +1,9 @@
 # BioLedger
 
+<p align="center">
+  <img src="docs/assets/logo.png" alt="BioLedger Logo" width="100%">
+</p>
+
 A provenance-tracking interactive analysis environment that retrospectively produces reproducible artifacts (ISA-Tab, workflows, RO-Crate).
 
 ## Core Concept
