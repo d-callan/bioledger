@@ -1,0 +1,88 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+from rocrate.rocrate import ROCrate
+
+from bioledger.ledger.models import EntryKind, LedgerSession
+
+
+def build_rocrate(
+    session: LedgerSession,
+    output_dir: Path,
+    entry_ids: list[str] | None = None,
+) -> Path:
+    """Package a ledger session (or subset) as an RO-Crate.
+
+    Args:
+        session: The full session
+        output_dir: Where to write crate files
+        entry_ids: If provided, only include these entries (user-selected subset).
+                   If None, include all entries.
+
+    The RO-Crate always includes:
+    - Data files consumed/produced by selected entries
+    - A Nextflow workflow crystallized from selected entries
+    - A ledger.json with provenance for selected entries
+    """
+    crate = ROCrate()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Filter entries if subset requested
+    if entry_ids is not None:
+        selected_ids = set(entry_ids)
+        entries = [e for e in session.entries if e.id in selected_ids]
+    else:
+        entries = session.entries
+
+    # Add data files from selected entries
+    added_files: set[str] = set()
+    for entry in entries:
+        for fref in entry.files:
+            dedup_key = f"{entry.id}:{fref.path}"
+            if dedup_key in added_files:
+                continue
+            p = Path(fref.path)
+            if p.exists():
+                dest = f"{entry.id[:8]}/{p.name}"
+                crate.add_file(
+                    str(p),
+                    dest_path=dest,
+                    properties={
+                        "description": f"{fref.role} for {entry.kind.value}",
+                        "sha256": fref.sha256,
+                    },
+                )
+                added_files.add(dedup_key)
+
+    # Build Nextflow workflow from selected entries only
+    tool_entries = [
+        e for e in entries if e.kind in (EntryKind.TOOL_RUN, EntryKind.SCRIPT_RUN)
+    ]
+    if tool_entries:
+        from bioledger.forges.analysisforge.crystallize import to_nextflow_from_entries
+
+        nf_content = to_nextflow_from_entries(tool_entries)
+        nf_path = output_dir / "workflow.nf"
+        nf_path.write_text(nf_content)
+        crate.add_workflow(
+            str(nf_path),
+            dest_path="workflow.nf",
+            main=True,
+            lang="nextflow",
+        )
+
+    # Add filtered ledger as provenance
+    filtered_session = session.model_copy()
+    filtered_session.entries = entries
+    ledger_path = output_dir / "ledger.json"
+    ledger_path.write_text(filtered_session.model_dump_json(indent=2))
+    crate.add_file(
+        str(ledger_path),
+        dest_path="ledger.json",
+        properties={"description": "BioLedger provenance log (selected entries)"},
+    )
+
+    crate_dir = output_dir / "ro-crate"
+    crate.write(str(crate_dir))
+    return crate_dir
