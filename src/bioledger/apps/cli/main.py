@@ -1,0 +1,473 @@
+from __future__ import annotations
+
+import asyncio
+import json
+from pathlib import Path
+
+import typer
+from rich.console import Console
+from rich.table import Table
+
+from bioledger.ledger.models import LedgerSession
+from bioledger.ledger.store import LedgerStore
+
+app = typer.Typer(name="bioledger", help="BioLedger: reproducible bio-analysis")
+session_app = typer.Typer(help="Manage analysis sessions")
+app.add_typer(session_app, name="session")
+console = Console()
+
+
+# --- Session management ---
+
+
+@session_app.command("new")
+def session_new(
+    name: str = typer.Option("", help="Session name"),
+    description: str = typer.Option("", help="What this analysis is about"),
+) -> None:
+    """Create a new analysis session."""
+    session = LedgerSession(name=name, description=description)
+    store = LedgerStore()
+    store.create_session(session)
+    console.print(f"[green]Session {session.id} created[/green]")
+    if name:
+        console.print(f"  Name: {name}")
+
+
+@session_app.command("list")
+def session_list(
+    all_sessions: bool = typer.Option(
+        False, "--all", help="Include archived sessions"
+    ),
+) -> None:
+    """List analysis sessions."""
+    store = LedgerStore()
+    status = None if all_sessions else "active"
+    rows = store.list_sessions(status=status)
+    if not rows:
+        console.print("[dim]No sessions found.[/dim]")
+        return
+    table = Table(title="Sessions")
+    table.add_column("ID", style="cyan")
+    table.add_column("Name")
+    table.add_column("Status")
+    table.add_column("Entries", justify="right")
+    table.add_column("Messages", justify="right")
+    table.add_column("Updated")
+    for r in rows:
+        s = store.load_session(r["id"], include_messages=False)
+        msg_count = store.message_count(r["id"])
+        table.add_row(
+            r["id"],
+            r["name"] or "(unnamed)",
+            r["status"],
+            str(len(s.entries)),
+            str(msg_count),
+            r["updated"][:16],
+        )
+    console.print(table)
+
+
+@session_app.command("show")
+def session_show(session_id: str) -> None:
+    """Show session details, entries, and recent chat."""
+    store = LedgerStore()
+    s = store.load_session(session_id)
+    console.print(f"[bold]Session {s.id}[/bold]  {s.name or '(unnamed)'}")
+    console.print(
+        f"  Status: {s.status.value}  |  "
+        f"Created: {s.created}  |  Updated: {s.updated}"
+    )
+    if s.description:
+        console.print(f"  Description: {s.description}")
+    console.print(
+        f"  Entries: {len(s.entries)}  |  "
+        f"Chat messages: {len(s.chat_messages)}"
+    )
+    # Show last 5 chat messages
+    if s.chat_messages:
+        console.print("\n[bold]Recent chat:[/bold]")
+        for msg in s.chat_messages[-5:]:
+            role_color = "green" if msg.role == "user" else "blue"
+            console.print(
+                f"  [{role_color}]{msg.role}[/{role_color}]: "
+                f"{msg.content[:120]}"
+            )
+
+
+@session_app.command("rename")
+def session_rename(session_id: str, name: str) -> None:
+    """Rename a session."""
+    store = LedgerStore()
+    store.rename_session(session_id, name)
+    console.print(f"[green]Session {session_id} renamed to '{name}'[/green]")
+
+
+@session_app.command("describe")
+def session_describe(session_id: str, description: str) -> None:
+    """Update a session's description."""
+    store = LedgerStore()
+    store.update_session_description(session_id, description)
+    console.print("[green]Description updated[/green]")
+
+
+@session_app.command("archive")
+def session_archive(session_id: str) -> None:
+    """Archive a session (soft-delete, still queryable)."""
+    store = LedgerStore()
+    store.archive_session(session_id)
+    console.print(f"[yellow]Session {session_id} archived[/yellow]")
+
+
+# --- Analysis ---
+
+
+@app.command()
+def resume(session_id: str) -> None:
+    """Resume an interactive analysis session (chat mode)."""
+    asyncio.run(_analysis_chat(session_id))
+
+
+async def _analysis_chat(session_id: str) -> None:
+    """Interactive chat loop for AnalysisForge.
+
+    Handles: dataset loading, LLM-powered tool suggestions, tool execution with
+    user confirmation, entry review, and selective RO-Crate packaging.
+    """
+    from bioledger.config import BioLedgerConfig
+    from bioledger.core.llm.agents import ForgeDeps
+    from bioledger.forges.analysisforge.agent import (
+        AnalysisForgeAgent,
+        ChatIntent,
+    )
+
+    config = BioLedgerConfig()
+    store = LedgerStore()
+    session = store.load_session(session_id, include_messages=True)
+    agent = AnalysisForgeAgent(config, session, store)
+
+    console.print(f"\n[bold]Session: {session.name or session.id}[/bold]")
+    console.print(
+        f"  {len(session.entries)} entries, "
+        f"{len(session.chat_messages)} messages"
+    )
+    console.print(
+        "[dim]Type 'quit' to exit, 'review' to see entries, "
+        "'package' to build RO-Crate[/dim]\n"
+    )
+
+    deps = ForgeDeps(
+        config=config,
+        session=session,
+        store=store,
+        context_mode="chat",
+    )
+
+    while True:
+        try:
+            user_input = console.input("[green]you>[/green] ").strip()
+        except (EOFError, KeyboardInterrupt):
+            break
+
+        if not user_input:
+            continue
+        if user_input.lower() == "quit":
+            break
+
+        # Record user message
+        session.add_message("user", user_input, forge="analysisforge")
+        store.append_message(session.id, session.chat_messages[-1])
+
+        # --- Special commands ---
+
+        if user_input.lower() == "review":
+            entries = agent.review_entries()
+            for e in entries:
+                kind = e["kind"]
+                icon = (
+                    "[yellow]TOOL[/yellow]"
+                    if kind == "tool_run"
+                    else "[cyan]DATA[/cyan]"
+                    if kind == "data_import"
+                    else "[dim]NOTE[/dim]"
+                )
+                console.print(
+                    f"  {icon} [{e['id']}] {e['kind']}: "
+                    f"{e['tool'] or e['notes']}  "
+                    f"outputs={[Path(p).name for p in e['outputs']]}"
+                )
+            continue
+
+        if user_input.lower().startswith("package"):
+            console.print("\n[bold]Package session into RO-Crate[/bold]")
+            entries = agent.review_entries()
+
+            console.print(
+                "Select entries to include (comma-separated IDs, or 'all'):"
+            )
+            for e in entries:
+                if e["kind"] in ("tool_run", "script_run"):
+                    console.print(
+                        f"  [{e['id']}] {e['tool']} -> "
+                        f"{[Path(p).name for p in e['outputs']]}"
+                    )
+
+            selection = console.input("[green]entries>[/green] ").strip()
+
+            if selection.lower() == "all":
+                entry_ids = None
+            else:
+                entry_ids = [eid.strip() for eid in selection.split(",")]
+
+            from bioledger.forges.crateforge.builder import build_rocrate
+
+            output_dir = config.home_dir / "crates" / session.id
+            crate_dir = build_rocrate(session, output_dir, entry_ids=entry_ids)
+            console.print(f"[green]RO-Crate written to {crate_dir}[/green]")
+
+            response = (
+                f"Packaged {'selected entries' if entry_ids else 'all entries'} "
+                f"into RO-Crate at {crate_dir}"
+            )
+            session.add_message("assistant", response, forge="analysisforge")
+            store.append_message(session.id, session.chat_messages[-1])
+            continue
+
+        if user_input.lower().startswith("load "):
+            isa_path = Path(user_input.split(" ", 1)[1].strip())
+            try:
+                dataset = await agent.load_dataset(isa_path)
+
+                # Check for remote files
+                remote = dataset.remote_files()
+                if remote:
+                    console.print(
+                        f"\n[yellow]Found {len(remote)} remote files:[/yellow]"
+                    )
+                    for f in remote:
+                        console.print(f"  - {f.location}")
+                    if typer.confirm("Download these files?"):
+                        download_dir = (
+                            config.home_dir / "datasets" / dataset.name
+                        )
+                        await agent.download_remote(download_dir)
+                        console.print(
+                            f"[green]Downloaded to {download_dir}[/green]"
+                        )
+
+                # Suggest workflow
+                suggestions = await agent.suggest_workflow()
+                response = suggestions["prompt_for_user"]
+                console.print(f"\n[blue]assistant>[/blue] {response}")
+
+                if suggestions.get("workflow"):
+                    console.print("\n[bold]Suggested workflow:[/bold]")
+                    for i, step in enumerate(suggestions["workflow"], 1):
+                        tools = suggestions.get("tools_by_step", {}).get(
+                            step, []
+                        )
+                        tools_str = f" ({', '.join(tools)})" if tools else ""
+                        console.print(f"  {i}. {step}{tools_str}")
+
+            except Exception as e:
+                response = f"Failed to load dataset: {e}"
+                console.print(f"[red]{response}[/red]")
+
+            session.add_message("assistant", response, forge="analysisforge")
+            store.append_message(session.id, session.chat_messages[-1])
+            continue
+
+        # --- General conversation: LLM decides what to do ---
+
+        result = await agent._chat_agent.run(user_input, deps=deps)
+        chat_response = result.output
+        response = chat_response.message
+
+        if chat_response.intent == ChatIntent.SUGGEST_TOOL:
+            try:
+                tool_request = await agent.suggest_next_tool(user_input)
+                console.print(
+                    f"\n[yellow]Suggested: {tool_request.tool_name}[/yellow]"
+                    f"\n  Reason: {tool_request.rationale}"
+                    f"\n  Params: {tool_request.suggested_params}"
+                )
+
+                if typer.confirm("Run this tool?"):
+                    input_files = _resolve_inputs(agent, tool_request)
+                    output_dir = (
+                        config.home_dir
+                        / "outputs"
+                        / session.id
+                        / tool_request.tool_name
+                    )
+
+                    entry, run_result = await agent.run_tool_with_logging(
+                        tool_request.tool_name,
+                        input_files,
+                        output_dir,
+                        params=tool_request.suggested_params,
+                    )
+
+                    if run_result.exit_code == 0:
+                        outputs = [
+                            Path(f.path).name
+                            for f in entry.files
+                            if f.role == "output"
+                        ]
+                        response = (
+                            f"{tool_request.tool_name} completed. "
+                            f"Outputs: {outputs}"
+                        )
+                    else:
+                        response = (
+                            f"{tool_request.tool_name} failed "
+                            f"(exit {run_result.exit_code}): "
+                            f"{run_result.stderr[:200]}"
+                        )
+
+                    console.print(f"\n[blue]assistant>[/blue] {response}")
+                else:
+                    response = (
+                        "OK, skipping tool run. What would you like to do "
+                        "instead?"
+                    )
+                    console.print(f"\n[blue]assistant>[/blue] {response}")
+            except KeyError as e:
+                response = f"Tool not found in store: {e}"
+                console.print(f"[red]{response}[/red]")
+            except Exception as e:
+                response = f"Error suggesting/running tool: {e}"
+                console.print(f"[red]{response}[/red]")
+        else:
+            # RESPOND or CLARIFY — just show the message
+            console.print(f"\n[blue]assistant>[/blue] {response}")
+
+        # Record assistant response
+        session.add_message("assistant", response, forge="analysisforge")
+        store.append_message(session.id, session.chat_messages[-1])
+
+
+def _resolve_inputs(agent: "AnalysisForgeAgent", tool_request: "ToolRunRequest") -> dict[str, Path]:  # noqa: F821
+    """Resolve input file paths from tool request mapping.
+
+    Resolution order for each input_name -> source:
+      1. Literal file path (if exists on disk)
+      2. Match against prior session output files (by filename or substring)
+      3. Match against dataset files (by filename, format, or substring)
+
+    Raises ValueError if any required input cannot be resolved.
+    """
+    from bioledger.ledger.models import EntryKind
+
+    input_files: dict[str, Path] = {}
+
+    for input_name, source in tool_request.input_mapping.items():
+        resolved = None
+
+        # 1. Literal path
+        p = Path(source)
+        if p.exists():
+            resolved = p
+
+        # 2. Search prior session outputs (most recent first)
+        if resolved is None:
+            for entry in reversed(agent.session.entries):
+                if entry.kind in (EntryKind.TOOL_RUN, EntryKind.SCRIPT_RUN):
+                    for f in entry.files:
+                        if f.role == "output":
+                            fp = Path(f.path)
+                            if fp.name == source or source in str(fp):
+                                resolved = fp
+                                break
+                if resolved:
+                    break
+
+        # 3. Search dataset files
+        if resolved is None and agent.dataset:
+            for f in agent.dataset.files:
+                loc = f.downloaded_path or f.location
+                lp = Path(loc)
+                if lp.name == source or source in str(lp) or f.format == source:
+                    if lp.exists():
+                        resolved = lp
+                        break
+
+        if resolved is None:
+            raise ValueError(
+                f"Cannot resolve input '{input_name}' from source '{source}'. "
+                f"Provide an explicit file path, a filename from a prior tool "
+                f"output, or a filename/format from the loaded dataset."
+            )
+        input_files[input_name] = resolved
+
+    return input_files
+
+
+# --- Crystallize ---
+
+
+@app.command()
+def crystallize(
+    session_id: str,
+    format: str = typer.Option(
+        "nextflow", help="Workflow format: 'nextflow' or 'galaxy'"
+    ),
+    entry_ids: list[str] = typer.Option(
+        None, "--entry", "-e", help="Specific entry IDs to include (default: all)"
+    ),
+) -> None:
+    """Convert a session (or selected entries) into a reproducible workflow."""
+    store = LedgerStore()
+    session = store.load_session(session_id)
+
+    if entry_ids:
+        from bioledger.forges.analysisforge.crystallize import (
+            to_nextflow_from_entries,
+        )
+
+        entries = [e for e in session.entries if e.id in set(entry_ids)]
+        console.print(to_nextflow_from_entries(entries))
+    elif format == "nextflow":
+        from bioledger.forges.analysisforge.crystallize import to_nextflow
+
+        console.print(to_nextflow(session))
+    elif format == "galaxy":
+        from bioledger.forges.analysisforge.crystallize import to_galaxy_workflow
+
+        console.print(json.dumps(to_galaxy_workflow(session), indent=2))
+
+
+# --- Package ---
+
+
+@app.command()
+def package(
+    session_id: str,
+    entry_ids: list[str] = typer.Option(
+        None, "--entry", "-e", help="Specific entry IDs (default: all)"
+    ),
+    output_dir: Path = typer.Option(
+        None, help="Output directory (default: ~/.bioledger/crates/<session_id>)"
+    ),
+) -> None:
+    """Package a session (or selected entries) into an RO-Crate."""
+    from bioledger.config import BioLedgerConfig
+    from bioledger.forges.crateforge.builder import build_rocrate
+
+    config = BioLedgerConfig()
+    store = LedgerStore()
+    session = store.load_session(session_id)
+
+    if output_dir is None:
+        output_dir = config.home_dir / "crates" / session_id
+
+    crate_dir = build_rocrate(session, output_dir, entry_ids=entry_ids)
+    console.print(f"[green]RO-Crate written to {crate_dir}[/green]")
+    console.print(
+        f"  Entries: {len(entry_ids) if entry_ids else len(session.entries)}"
+    )
+    console.print("  Includes: workflow.nf, data files, ledger.json")
+
+
+if __name__ == "__main__":
+    app()
