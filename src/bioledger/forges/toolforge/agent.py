@@ -1,0 +1,100 @@
+from __future__ import annotations
+
+from bioledger.config import BioLedgerConfig
+from bioledger.core.llm.agents import ForgeDeps, make_agent
+from bioledger.toolspec.models import ExecutionSpec, ToolSpec
+from bioledger.toolspec.validate import ValidationIssue
+
+
+class ToolForgeAgent:
+    """Holds pre-created agents for all ToolForge LLM tasks.
+    Reuse across calls — don't recreate agents per invocation."""
+
+    def __init__(self, config: BioLedgerConfig):
+        self._parse_agent = make_agent(
+            config,
+            task="parse_fallback",
+            instructions=(
+                "You are a bioinformatics tool spec parser. "
+                "Extract name, version, container, command, inputs, outputs, parameters "
+                "from the provided tool definition. Return a valid ExecutionSpec."
+            ),
+            output_type=ExecutionSpec,
+        )
+        self._fix_agent = make_agent(
+            config,
+            task="fix_issues",
+            instructions=(
+                "You are a BioLedger tool spec validator. "
+                "Fix the listed issues in the ExecutionSpec. Return a corrected ExecutionSpec."
+            ),
+            output_type=ExecutionSpec,
+        )
+        self._review_agent = make_agent(
+            config,
+            task="review",
+            instructions=(
+                "You are a bioinformatics tool expert. Review this ExecutionSpec for "
+                "conceptual correctness: does the command make sense? Are formats correct? "
+                "Are parameter defaults reasonable? Return a list of issues (strings). "
+                "Return an empty list if everything looks good."
+            ),
+            output_type=list[str],
+        )
+        self._enrich_agent = make_agent(
+            config,
+            task="enrich_export",
+            instructions=(
+                "You are an expert in Galaxy tool XML and Nextflow DSL2. "
+                "Review and optionally improve the generated output. "
+                "Add help text, citations, or fix structural issues. "
+                "Return the improved output as a string."
+            ),
+            output_type=str,
+        )
+
+    async def parse(
+        self, source_text: str, source_type: str, error: str, deps: ForgeDeps
+    ) -> ExecutionSpec:
+        """LLM fallback: parse a tool definition when programmatic parser fails."""
+        prompt = (
+            f"The programmatic {source_type} parser failed with: {error}\n\n"
+            f"Parse this {source_type} and produce a valid ExecutionSpec:\n\n{source_text}"
+        )
+        result = await self._parse_agent.run(prompt, deps=deps)
+        return result.output
+
+    async def fix(
+        self, spec: ExecutionSpec, issues: list[ValidationIssue], deps: ForgeDeps
+    ) -> ExecutionSpec:
+        """LLM fixes validation issues in a spec."""
+        issues_str = "\n".join(f"- {i.field}: {i.message}" for i in issues)
+        prompt = f"Fix these issues:\n{issues_str}\n\nSpec:\n{spec.model_dump_json(indent=2)}"
+        result = await self._fix_agent.run(prompt, deps=deps)
+        return result.output
+
+    async def review(
+        self, spec: ExecutionSpec, source: str, deps: ForgeDeps
+    ) -> list[str]:
+        """LLM reviews the spec for conceptual correctness."""
+        prompt = (
+            f"Review this spec (imported from {source}):\n\n"
+            f"{spec.model_dump_json(indent=2)}"
+        )
+        result = await self._review_agent.run(prompt, deps=deps)
+        return result.output
+
+    async def enrich_export(
+        self,
+        spec: ToolSpec,
+        generated_output: str,
+        target_format: str,
+        deps: ForgeDeps,
+    ) -> str:
+        """LLM reviews and improves generated Galaxy XML or Nextflow DSL2."""
+        prompt = (
+            f"Original BioLedger spec:\n{spec.model_dump_json(indent=2)}\n\n"
+            f"Generated {target_format}:\n{generated_output}"
+        )
+        result = await self._enrich_agent.run(prompt, deps=deps)
+        return result.output
