@@ -11,7 +11,7 @@ from bioledger.core.llm.config import LLMConfig
 class BioLedgerConfig(BaseSettings):
     """Global configuration. Loaded from env vars and/or ~/.bioledger/config.yaml."""
 
-    model_config = {"env_prefix": "BIOLEDGER_"}
+    model_config = {"env_prefix": "BIOLEDGER_", "env_file": ".env", "env_file_encoding": "utf-8"}
 
     home_dir: Path = Field(default_factory=lambda: Path.home() / ".bioledger")
     llm: LLMConfig = LLMConfig()
