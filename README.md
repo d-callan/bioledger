@@ -194,12 +194,11 @@ export ANTHROPIC_API_KEY="sk-ant-..."
 export GOOGLE_API_KEY="..."
 ```
 
-Or create a `.env` file (BioLedger loads it automatically):
+Or copy the example `.env` file and fill in your keys (BioLedger loads it automatically):
 
 ```bash
-# .env
-OPENAI_API_KEY=sk-...
-BIOLEDGER_HOME_DIR=~/.bioledger
+cp .env.example .env
+# Edit .env with your API key
 ```
 
 The default model is `openai:gpt-4o`. You can override it via config or environment:
