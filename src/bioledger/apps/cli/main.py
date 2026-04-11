@@ -13,7 +13,9 @@ from bioledger.ledger.store import LedgerStore
 
 app = typer.Typer(name="bioledger", help="BioLedger: reproducible bio-analysis")
 session_app = typer.Typer(help="Manage analysis sessions")
+tool_app = typer.Typer(help="Manage tool specifications")
 app.add_typer(session_app, name="session")
+app.add_typer(tool_app, name="tool")
 console = Console()
 
 
@@ -117,6 +119,191 @@ def session_archive(session_id: str) -> None:
     store = LedgerStore()
     store.archive_session(session_id)
     console.print(f"[yellow]Session {session_id} archived[/yellow]")
+
+
+# --- Tool management ---
+
+
+@tool_app.command("import")
+def tool_import(
+    path: Path,
+    name: str = typer.Option("", help="Override tool name"),
+) -> None:
+    """Import a tool from Galaxy XML, Nextflow module, or BioLedger YAML."""
+    from bioledger.toolspec.load import load_spec
+    from bioledger.toolspec.models import ToolSpec
+    from bioledger.toolspec.store import ToolStore
+    from bioledger.toolspec.validate import validate_spec
+
+    suffix = path.suffix.lower()
+    if suffix in (".xml",):
+        from bioledger.forges.toolforge.translators.galaxy import from_galaxy_xml
+
+        exec_spec = from_galaxy_xml(path.read_text())
+        if name:
+            exec_spec.name = name
+        spec = ToolSpec(execution=exec_spec)
+    elif suffix in (".nf",):
+        from bioledger.forges.toolforge.translators.nextflow import (
+            from_nextflow_module,
+        )
+
+        exec_spec = from_nextflow_module(path.read_text())
+        if name:
+            exec_spec.name = name
+        spec = ToolSpec(execution=exec_spec)
+    elif suffix in (".yaml", ".yml"):
+        spec = load_spec(path)
+    else:
+        console.print(f"[red]Unsupported file type: {suffix}[/red]")
+        raise typer.Exit(1)
+
+    result = validate_spec(spec)
+    store = ToolStore()
+    out = store.save(spec)
+    console.print(f"[green]Imported '{spec.name}' → {out}[/green]")
+
+    if result.issues:
+        for issue in result.issues:
+            color = (
+                "red" if issue.severity.value == "error"
+                else "yellow" if issue.severity.value == "warning"
+                else "dim"
+            )
+            console.print(f"  [{color}]{issue.severity.value}[/{color}] {issue.message}")
+
+
+@tool_app.command("validate")
+def tool_validate(
+    path: Path,
+    strict: bool = typer.Option(False, "--strict", help="Treat warnings as errors"),
+) -> None:
+    """Validate a tool spec file."""
+    from bioledger.toolspec.load import load_spec
+    from bioledger.toolspec.validate import validate_spec
+
+    spec = load_spec(path)
+    result = validate_spec(spec, strict=strict)
+
+    if result.is_valid and (not strict or result.is_strict_valid):
+        console.print(f"[green]✓ {spec.name} is valid[/green]")
+    else:
+        console.print(f"[red]✗ {spec.name} has issues[/red]")
+
+    for issue in result.issues:
+        color = (
+            "red" if issue.severity.value == "error"
+            else "yellow" if issue.severity.value == "warning"
+            else "dim"
+        )
+        console.print(f"  [{color}]{issue.severity.value}[/{color}] {issue.field}: {issue.message}")
+
+    if not result.is_valid:
+        raise typer.Exit(1)
+
+
+@tool_app.command("list")
+def tool_list(
+    search: str = typer.Option("", help="Filter by name substring"),
+) -> None:
+    """List tool specs in the local store."""
+    from bioledger.toolspec.store import ToolStore
+
+    store = ToolStore()
+    specs = store.search(name=search) if search else store.list_all()
+
+    if not specs:
+        console.print("[dim]No tools found.[/dim]")
+        return
+
+    table = Table(title="Tool Specs")
+    table.add_column("Name", style="cyan")
+    table.add_column("Container")
+    table.add_column("Status")
+    table.add_column("Inputs", justify="right")
+    table.add_column("Outputs", justify="right")
+
+    for spec in specs:
+        ex = spec.execution
+        table.add_row(
+            ex.name,
+            ex.container,
+            ex.status.value,
+            str(len(ex.inputs)),
+            str(len(ex.outputs)),
+        )
+    console.print(table)
+
+
+@tool_app.command("show")
+def tool_show(name: str) -> None:
+    """Show details of a tool spec."""
+    from bioledger.toolspec.store import ToolStore
+
+    store = ToolStore()
+    try:
+        spec = store.load(name)
+    except KeyError:
+        console.print(f"[red]Tool '{name}' not found[/red]")
+        raise typer.Exit(1)
+
+    ex = spec.execution
+    console.print(f"[bold]{ex.name}[/bold]  v{ex.version or '(unset)'}")
+    console.print(f"  Container: {ex.container}")
+    console.print(f"  Status:    {ex.status.value}")
+    console.print(f"  Command:   {ex.command}")
+
+    if ex.description:
+        console.print(f"  Desc:      {ex.description}")
+
+    if ex.inputs:
+        console.print("\n  [bold]Inputs:[/bold]")
+        for k, v in ex.inputs.items():
+            console.print(f"    {k}: {v.format} ({'required' if v.required else 'optional'})")
+
+    if ex.outputs:
+        console.print("\n  [bold]Outputs:[/bold]")
+        for k, v in ex.outputs.items():
+            console.print(f"    {k}: {v.format}")
+
+    if ex.parameters:
+        console.print("\n  [bold]Parameters:[/bold]")
+        for k, v in ex.parameters.items():
+            default = f" = {v.default}" if v.default is not None else ""
+            console.print(f"    {k}: {v.type.value}{default}")
+
+
+@tool_app.command("export")
+def tool_export(
+    name: str,
+    format: str = typer.Option("nextflow", help="Export format: 'nextflow' or 'galaxy'"),
+    output: Path = typer.Option(None, "-o", help="Output file (default: stdout)"),
+) -> None:
+    """Export a tool spec to Galaxy XML or Nextflow DSL2."""
+    from bioledger.toolspec.store import ToolStore
+
+    store = ToolStore()
+    try:
+        spec = store.load(name)
+    except KeyError:
+        console.print(f"[red]Tool '{name}' not found[/red]")
+        raise typer.Exit(1)
+
+    if format == "galaxy":
+        from bioledger.forges.toolforge.translators.galaxy import to_galaxy_xml
+        result = to_galaxy_xml(spec.execution)
+    elif format == "nextflow":
+        from bioledger.forges.toolforge.translators.nextflow import to_nextflow_process
+        result = to_nextflow_process(spec.execution)
+    else:
+        console.print(f"[red]Unknown format: {format}[/red]")
+        raise typer.Exit(1)
+
+    if output:
+        output.write_text(result)
+        console.print(f"[green]Written to {output}[/green]")
+    else:
+        console.print(result)
 
 
 # --- Analysis ---
