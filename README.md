@@ -39,143 +39,47 @@ When you **crystallize** a session, BioLedger walks this DAG to produce a workfl
 
 Chat messages (the back-and-forth with the LLM) are stored separately from ledger entries — they drive the conversation context but aren't part of the provenance graph.
 
-## Hello World: End-to-End Walkthrough
+## Hello World
 
-This walkthrough creates dummy data, defines a simple custom tool, runs it in a session, and packages the result. You'll need an LLM API key set (see [Prerequisites](#prerequisites)) and Docker running.
-
-### 1. Create dummy data
+The [`examples/hello_bioledger/`](examples/hello_bioledger/) directory contains a complete end-to-end walkthrough: load an ISA-Tab dataset, import a custom tool, run it in a session, crystallize a workflow, and package everything into an RO-Crate.
 
 ```bash
-mkdir -p hello_bioledger && cd hello_bioledger
+# Import the example tool
+bioledger tool import examples/hello_bioledger/line_counter.bioledger.yaml
 
-cat > samples.csv <<'EOF'
-sample_id,organism,reads_file
-S001,Mus musculus,S001_R1.fastq.gz
-S002,Mus musculus,S002_R1.fastq.gz
-S003,Homo sapiens,S003_R1.fastq.gz
-EOF
+# Create a session
+bioledger session new --name "hello world"
+
+# Start the interactive session
+bioledger resume <session_id>
 ```
 
-### 2. Write a tool spec
-
-Create a minimal tool spec for a Python one-liner that counts rows in a CSV and writes a summary. We're writing this by hand for the tutorial, but in practice **ToolForge can generate these for you** — import an existing Galaxy tool XML (`bioledger tool import fastqc.xml`), parse an nf-core Nextflow module (`bioledger tool import trimmomatic.nf`), or ask the LLM to draft one from scratch in an interactive session.
-
-```yaml
-# row_counter.bioledger.yaml
-spec_version: "0.1"
-execution:
-  name: row_counter
-  version: "1.0"
-  description: "Count rows in a CSV file (excluding header)"
-  container: "python:3.11-slim"
-  command: >-
-    python -c "
-    import csv, json, sys;
-    reader = csv.reader(open('/data/input/{{inputs.csv_file}}'));
-    header = next(reader);
-    rows = list(reader);
-    result = {'file': '{{inputs.csv_file}}', 'columns': header, 'row_count': len(rows)};
-    json.dump(result, open('/data/output/summary.json', 'w'), indent=2);
-    print(f'Counted {len(rows)} rows')
-    "
-  inputs:
-    csv_file:
-      type: file
-      format: csv
-      required: true
-      description: "Input CSV file"
-  outputs:
-    summary:
-      format: json
-      description: "JSON summary with row count and column names"
-  parameters:
-    {}
-  categories:
-    - utility
-```
-
-### 3. Import and validate the tool
-
-```bash
-bioledger tool import row_counter.bioledger.yaml
-# ✓ Imported 'row_counter' → ~/.bioledger/tools/row_counter.bioledger.yaml
-
-bioledger tool validate ~/.bioledger/tools/row_counter.bioledger.yaml
-# ✓ row_counter is valid
-
-bioledger tool show row_counter
-# row_counter  v1.0
-#   Container: python:3.11-slim
-#   Status:    draft
-#   Command:   python -c "..."
-#
-#   Inputs:
-#     csv_file: csv (required)
-#
-#   Outputs:
-#     summary: json
-```
-
-### 4. Create a session and run the tool
-
-```bash
-bioledger session new --name "hello world" --description "Testing row_counter on dummy data"
-# Session a1b2c3d4 created
-#   Name: hello world
-
-bioledger resume a1b2c3d4
-```
-
-Inside the interactive session:
+Inside the session:
 
 ```
-you> load samples.csv
-assistant> Loaded 1 file (csv). What would you like to do with it?
+you> load examples/hello_bioledger/data/
+assistant> Loaded dataset "Sample metadata analysis" — 3 samples, 2 organisms
 
-you> run row_counter on samples.csv
-assistant> Suggested: row_counter
-           Params: {}
-           Run this tool? [y/N]: y
-assistant> row_counter completed. Outputs: [summary.json]
-
-you> review
-  DATA [e1f2a3b4] data_import: samples.csv
-  TOOL [c5d6e7f8] tool_run: row_counter  outputs=[summary.json]
+you> run line_counter on s_study.txt
+assistant> line_counter completed. Outputs: [summary.json]
 
 you> quit
 ```
 
-At this point, the ledger contains two entries chained together: a `data_import` and a `tool_run` whose `parent_id` points back to the import.
-
-### 5. Crystallize and package
-
 ```bash
-# See the workflow BioLedger built from your session
-bioledger crystallize a1b2c3d4
-# nextflow.enable.dsl=2
-#
-# process ROW_COUNTER_0 {
-#     container 'python:3.11-slim'
-#     input: path(csv_file)
-#     output: path('summary.json')
-#     script: ...
-# }
-#
-# workflow {
-#     ch_input = Channel.fromPath(params.input)
-#     ROW_COUNTER_0(ch_input)
-# }
+# Generate a Nextflow workflow from the session
+bioledger crystallize <session_id>
 
-# Bundle everything into an RO-Crate
-bioledger package a1b2c3d4
-# RO-Crate written to ~/.bioledger/crates/a1b2c3d4
-#   Entries: 2
-#   Includes: workflow.nf, data files, ledger.json
+# Bundle into an RO-Crate
+bioledger package <session_id>
 ```
 
-The crate at `~/.bioledger/crates/a1b2c3d4/` now contains `ro-crate-metadata.json`, the crystallized `workflow.nf`, `ledger.json` with the full provenance, and copies of `samples.csv` and `summary.json`.
+ISA-Tab to reproducible package without writing workflow syntax. See the [full walkthrough](examples/hello_bioledger/README.md) for details on what BioLedger records at each step.
 
-That's it — you went from raw data to a reproducible, packaged analysis without ever thinking about workflow syntax.
+### More examples
+
+- **[Galaxy tool import](examples/galaxy_tool_import/)** — import existing Galaxy tool wrappers into BioLedger
+- **[CSV to ISA-Tab](examples/csv_to_isatab/)** — start from a plain samplesheet and convert to structured metadata
 
 ## Prerequisites
 
@@ -201,10 +105,12 @@ cp .env.example .env
 # Edit .env with your API key
 ```
 
-The default model is `openai:gpt-4o`. You can override it via config or environment:
+The default model is `openai:gpt-4o`. To use a different provider, set both the API key and the model:
 
 ```bash
-export BIOLEDGER_LLM='{"default_model": "anthropic:claude-sonnet-4-20250514"}'
+# Example: switch to Google Gemini
+GOOGLE_API_KEY=...
+BIOLEDGER_DEFAULT_MODEL=google-gla:gemini-2.5-flash
 ```
 
 ### Docker (optional)
@@ -296,16 +202,19 @@ Tool specs are stored as YAML in `~/.bioledger/tools/` and use a two-layer model
 
 ### AnalysisForge — Interactive Analysis
 
-AnalysisForge powers the interactive chat loop. Load a dataset, get LLM-powered tool suggestions, run tools in Docker containers, and review outputs — all tracked in the ledger.
+AnalysisForge powers the interactive chat loop. Load a dataset (CSV samplesheet or ISA-Tab directory), get LLM-powered tool suggestions, run tools in Docker containers, and review outputs — all tracked in the ledger.
 
 ```bash
 # Start or resume an interactive session
 bioledger resume <session_id>
 ```
 
-Inside the session:
+Inside the session, use `load` with a CSV samplesheet or ISA-Tab directory:
 
 ```
+you> load samples.csv
+assistant> Loaded dataset "Samples" — 3 samples, 2 organisms (Mus musculus, Homo sapiens)
+
 you> load /path/to/isa-tab/
 assistant> Loaded dataset "my_rnaseq" (3 samples, formats: fastq, txt).
            Suggested workflow:
@@ -391,9 +300,10 @@ BioLedger reads configuration from environment variables prefixed with `BIOLEDGE
 | `OPENAI_API_KEY` | — | OpenAI API key (or use another provider's key) |
 | `ANTHROPIC_API_KEY` | — | Anthropic API key |
 | `GOOGLE_API_KEY` | — | Google AI API key |
+| `BIOLEDGER_DEFAULT_MODEL` | `openai:gpt-4o` | LLM model in `provider:model` format (also switches primary task models) |
 | `BIOLEDGER_HOME_DIR` | `~/.bioledger` | Data directory for sessions, tools, cache |
 
-LLM model selection uses [litellm](https://docs.litellm.ai/) format (`provider:model` or `provider/model`). The default model is `openai:gpt-4o`, with `openai:gpt-4o-mini` for utility tasks and fallback chains to Anthropic and Gemini.
+Setting `BIOLEDGER_DEFAULT_MODEL` switches the provider for all primary tasks. Utility tasks (parsing, fixing, review) stay on `openai:gpt-4o-mini` by default. Providers: `openai`, `anthropic`, `google-gla`, `google-vertex`, `groq`, `ollama`. See `.env.example` for examples.
 
 ## Development
 

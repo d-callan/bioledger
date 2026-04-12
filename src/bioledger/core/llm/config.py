@@ -17,7 +17,8 @@ class ProviderConfig(BaseModel):
 
 class LLMConfig(BaseModel):
     """LLM settings — nested inside BioLedgerConfig, not standalone.
-    All model strings use litellm format: 'provider:model' or 'provider/model'.
+    All model strings use pydantic-ai format: 'provider:model'.
+    Providers: openai, anthropic, google-gla, google-vertex, groq, ollama.
     API keys come from env vars (OPENAI_API_KEY, ANTHROPIC_API_KEY, etc.)."""
 
     default_model: str = "openai:gpt-4o"
@@ -48,7 +49,7 @@ class LLMConfig(BaseModel):
     fallback_models: list[str] = Field(
         default_factory=lambda: [
             "anthropic:claude-sonnet-4-20250514",
-            "gemini/gemini-2.0-flash",
+            "google-gla:gemini-2.5-flash",
         ]
     )
 

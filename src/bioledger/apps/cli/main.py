@@ -4,12 +4,16 @@ import asyncio
 import json
 from pathlib import Path
 
-import typer
-from rich.console import Console
-from rich.table import Table
+from dotenv import load_dotenv
 
-from bioledger.ledger.models import LedgerSession
-from bioledger.ledger.store import LedgerStore
+load_dotenv()  # Load .env into process environment before anything else
+
+import typer  # noqa: E402
+from rich.console import Console  # noqa: E402
+from rich.table import Table  # noqa: E402
+
+from bioledger.ledger.models import LedgerSession  # noqa: E402
+from bioledger.ledger.store import LedgerStore  # noqa: E402
 
 app = typer.Typer(name="bioledger", help="BioLedger: reproducible bio-analysis")
 session_app = typer.Typer(help="Manage analysis sessions")
@@ -421,9 +425,21 @@ async def _analysis_chat(session_id: str) -> None:
             continue
 
         if user_input.lower().startswith("load "):
-            isa_path = Path(user_input.split(" ", 1)[1].strip())
+            data_path = Path(user_input.split(" ", 1)[1].strip())
             try:
-                dataset = await agent.load_dataset(isa_path)
+                dataset = await agent.load_dataset(data_path)
+
+                # Show dataset summary
+                samples = len(dataset.sample_metadata)
+                orgs = ", ".join(dataset.organisms) if dataset.organisms else "unknown"
+                fmts = ", ".join(dataset.file_formats) if dataset.file_formats else "none"
+                console.print(
+                    f'\n[green]Loaded dataset "{dataset.name}"[/green]'
+                    f"\n  Samples: {samples}"
+                    f"\n  Organisms: {orgs}"
+                    f"\n  File formats: {fmts}"
+                    f"\n  Files: {len(dataset.files)}"
+                )
 
                 # Check for remote files
                 remote = dataset.remote_files()
