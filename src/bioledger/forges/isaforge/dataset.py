@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -94,6 +95,159 @@ def _infer_format(location: str) -> str:
         p = p.with_suffix("")
     ext = p.suffix.lstrip(".").lower()
     return _FORMAT_MAP.get(ext, ext or "unknown")
+
+
+@dataclass
+class ParsedCSV:
+    """Result of parsing a CSV samplesheet — used by both
+    load_dataset_from_csv and csv_to_isatab."""
+
+    rows: list[dict[str, str]]
+    fieldnames: list[str]
+    sample_col: str | None
+    organism_col: str | None
+    file_columns: list[str]
+
+
+def parse_csv_samplesheet(csv_path: Path) -> ParsedCSV:
+    """Parse a CSV samplesheet, detecting sample ID, organism, and file columns.
+
+    Expects a CSV with at least a header row. Columns whose values look like
+    file paths (contain '.' with a recognized extension) are treated as data
+    file references.  A column named 'organism' (case-insensitive) populates
+    the organisms list.  A column named 'sample_id' or 'sample_name' is used
+    as the sample identifier.
+    """
+    import csv
+
+    if not csv_path.exists():
+        raise FileNotFoundError(f"CSV file not found: {csv_path}")
+
+    with open(csv_path, newline="") as fh:
+        reader = csv.DictReader(fh)
+        if reader.fieldnames is None:
+            raise ValueError(f"CSV file appears empty: {csv_path}")
+
+        rows = list(reader)
+
+    if not rows:
+        raise ValueError(f"CSV file has headers but no data rows: {csv_path}")
+
+    headers_lower = {h.lower(): h for h in reader.fieldnames}
+
+    # Detect sample ID column
+    sample_col = None
+    for candidate in ("sample_id", "sample_name", "sample", "name", "id"):
+        if candidate in headers_lower:
+            sample_col = headers_lower[candidate]
+            break
+
+    # Detect organism column
+    organism_col = headers_lower.get("organism")
+
+    # Detect file-like columns (values with recognized extensions)
+    file_columns: list[str] = []
+    for col in reader.fieldnames:
+        for row in rows[:5]:  # check first few rows
+            val = row.get(col, "")
+            if val and "." in val:
+                ext = val.rsplit(".", 1)[-1].lower()
+                # Strip compression
+                if ext in ("gz", "bz2", "xz", "zst"):
+                    parts = val.rsplit(".", 2)
+                    if len(parts) >= 2:
+                        # parts[-2] is the extension before compression (e.g., 'fastq' in 'file.fastq.gz')
+                        ext = parts[-2].rsplit(".", 1)[-1].lower() if "." in parts[-2] else parts[-2].lower()
+                if ext in _FORMAT_MAP:
+                    file_columns.append(col)
+                    break
+
+    return ParsedCSV(
+        rows=rows,
+        fieldnames=list(reader.fieldnames),
+        sample_col=sample_col,
+        organism_col=organism_col,
+        file_columns=file_columns,
+    )
+
+
+def load_dataset_from_csv(csv_path: Path) -> DataSet:
+    """Load a DataSet from a CSV samplesheet.
+
+    This is a lightweight loader for quick exploration. For proper provenance
+    tracking, use csv_to_isatab() in isaforge.builder to convert to ISA-Tab
+    first, then load with load_dataset_from_isatab().
+    """
+    parsed = parse_csv_samplesheet(csv_path)
+
+    # Build files and metadata
+    files: list[DataFile] = []
+    seen_formats: set[str] = set()
+    file_formats: list[str] = []
+    organisms: list[str] = []
+    sample_metadata: dict[str, dict] = {}
+
+    csv_dir = csv_path.parent
+
+    for row in parsed.rows:
+        sample_name = row.get(parsed.sample_col, "") if parsed.sample_col else ""
+
+        # Collect organism
+        if parsed.organism_col:
+            org = row.get(parsed.organism_col, "").strip()
+            if org and org not in organisms:
+                organisms.append(org)
+
+        # Collect file references
+        for col in parsed.file_columns:
+            location = row.get(col, "").strip()
+            if not location:
+                continue
+            is_remote = location.startswith(("http://", "https://", "ftp://", "s3://"))
+            fmt = _infer_format(location)
+            if fmt not in seen_formats:
+                seen_formats.add(fmt)
+                file_formats.append(fmt)
+
+            if not is_remote:
+                resolved = csv_dir / location
+                location = str(resolved) if resolved.exists() else location
+
+            files.append(
+                DataFile(
+                    location=location,
+                    format=fmt,
+                    is_remote=is_remote,
+                    sample_name=sample_name,
+                )
+            )
+
+        # Build sample metadata from non-file columns
+        meta_cols = [c for c in parsed.fieldnames if c not in parsed.file_columns]
+        sample_metadata[sample_name or f"row_{parsed.rows.index(row)}"] = {
+            col: row.get(col, "") for col in meta_cols
+        }
+
+    # Also register the CSV itself as a file
+    csv_ref = DataFile(
+        location=str(csv_path.resolve()),
+        format="csv",
+        sample_name="",
+    )
+    if "csv" not in seen_formats:
+        file_formats.insert(0, "csv")
+    files.insert(0, csv_ref)
+
+    dataset_name = csv_path.stem.replace("_", " ").replace("-", " ").title()
+
+    return DataSet(
+        name=dataset_name,
+        description=f"Loaded from CSV samplesheet: {csv_path.name}",
+        files=files,
+        file_formats=file_formats,
+        organisms=organisms,
+        sample_metadata=sample_metadata,
+    )
 
 
 def load_dataset_from_isatab(isa_dir: Path, validate: bool = True) -> DataSet:
