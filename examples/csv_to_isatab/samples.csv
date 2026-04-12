@@ -1,0 +1,4 @@
+sample_id,organism,reads_file
+S001,Mus musculus,S001_R1.fastq.gz
+S002,Mus musculus,S002_R1.fastq.gz
+S003,Homo sapiens,S003_R1.fastq.gz
