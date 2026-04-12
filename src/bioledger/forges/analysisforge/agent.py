@@ -11,7 +11,11 @@ from bioledger.config import BioLedgerConfig
 from bioledger.core.llm.agents import ForgeDeps, make_agent
 from bioledger.forges.analysisforge.executor import run_tool
 from bioledger.forges.analysisforge.suggest import suggest_analysis_for_dataset
-from bioledger.forges.isaforge.dataset import DataSet, load_dataset_from_isatab
+from bioledger.forges.isaforge.builder import csv_to_isatab
+from bioledger.forges.isaforge.dataset import (
+    DataSet,
+    load_dataset_from_isatab,
+)
 from bioledger.forges.isaforge.download import download_remote_files
 from bioledger.ledger.models import EntryKind, FileRef, LedgerEntry, LedgerSession
 from bioledger.ledger.store import LedgerStore
@@ -110,9 +114,27 @@ class AnalysisForgeAgent:
             output_type=ToolRunRequest,
         )
 
-    async def load_dataset(self, isa_dir: Path) -> DataSet:
-        """Load ISA-Tab into the session, record as DATA_IMPORT entry."""
-        dataset = load_dataset_from_isatab(isa_dir)
+    async def load_dataset(self, path: Path) -> DataSet:
+        """Load a dataset into the session, record as DATA_IMPORT entry.
+
+        Accepts either:
+        - A CSV samplesheet file (.csv) — converted to ISA-Tab via ISAForge first
+        - An ISA-Tab directory (containing i_investigation.txt)
+
+        AnalysisForge always works with ISA-Tab internally for proper
+        provenance and metadata tracking.
+        """
+        if path.is_file() and path.suffix.lower() == ".csv":
+            # Route through ISAForge: CSV → ISA-Tab → load
+            isatab_dir = (
+                self.config.home_dir / "datasets" / path.stem
+            )
+            await csv_to_isatab(path, isatab_dir, config=self.config)
+            dataset = load_dataset_from_isatab(isatab_dir, validate=False)
+            source_desc = f"{path} (converted to ISA-Tab at {isatab_dir})"
+        else:
+            dataset = load_dataset_from_isatab(path)
+            source_desc = str(path)
         self.dataset = dataset
 
         # Record DATA_IMPORT entry in ledger
@@ -135,14 +157,14 @@ class AnalysisForgeAgent:
             kind=EntryKind.DATA_IMPORT,
             files=file_refs,
             params={
-                "isa_tab_dir": str(isa_dir),
+                "source": source_desc,
                 "organisms": dataset.organisms,
                 "assay_type": dataset.assay_type,
                 "file_formats": list(dataset.file_formats),
                 "file_count": len(dataset.files),
                 "remote_count": len(dataset.remote_files()),
             },
-            notes=f"Loaded ISA-Tab dataset: {dataset.name}",
+            notes=f"Loaded dataset: {dataset.name}",
         )
         self.session.add(entry)
         self.store.save_session(self.session)
