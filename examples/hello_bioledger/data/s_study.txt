@@ -1,0 +1,4 @@
+Source Name	Characteristics[Organism]	Term Source REF	Term Accession Number	Sample Name
+source_S001	Mus musculus	NCBITAXON		S001
+source_S002	Mus musculus	NCBITAXON		S002
+source_S003	Homo sapiens	NCBITAXON		S003

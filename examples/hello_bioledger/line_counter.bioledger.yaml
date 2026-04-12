@@ -1,0 +1,29 @@
+spec_version: "0.1"
+execution:
+  name: line_counter
+  version: "1.0"
+  description: "Count lines in a text file (including header if present)"
+  container: "python:3.11-slim"
+  command: >-
+    python -c "
+    import json, sys;
+    with open('/data/input/{{inputs.input_file}}') as f:
+        lines = f.readlines();
+    result = {'file': '{{inputs.input_file}}', 'line_count': len(lines)};
+    json.dump(result, open('/data/output/summary.json', 'w'), indent=2);
+    print(f'Counted {len(lines)} lines')
+    "
+  inputs:
+    input_file:
+      type: file
+      format: tsv
+      required: true
+      description: "Input text file (e.g., ISA-Tab study file)"
+  outputs:
+    summary:
+      format: json
+      description: "JSON summary with line count"
+  parameters:
+    {}
+  categories:
+    - utility

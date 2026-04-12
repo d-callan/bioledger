@@ -1,0 +1,4 @@
+Sample Name	Protocol REF	Raw Data File
+S001	nucleotide sequencing	S001_R1.fastq.gz
+S002	nucleotide sequencing	S002_R1.fastq.gz
+S003	nucleotide sequencing	S003_R1.fastq.gz
