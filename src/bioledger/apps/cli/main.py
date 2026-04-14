@@ -331,11 +331,28 @@ async def _analysis_chat(session_id: str) -> None:
         AnalysisForgeAgent,
         ChatIntent,
     )
+    from bioledger.forges.isaforge.dataset import load_dataset_from_isatab
+    from bioledger.ledger.models import EntryKind
 
     config = BioLedgerConfig()
     store = LedgerStore()
     session = store.load_session(session_id, include_messages=True)
     agent = AnalysisForgeAgent(config, session, store)
+
+    # Restore dataset from prior DATA_IMPORT entry (if any)
+    for entry in session.entries:
+        if entry.kind == EntryKind.DATA_IMPORT and "source" in entry.params:
+            source = entry.params["source"]
+            # Strip conversion suffix if present (e.g. "path (converted to ISA-Tab at ...)")
+            if " (converted to ISA-Tab at " in source:
+                isatab_path = source.split("(converted to ISA-Tab at ")[-1].rstrip(")")
+            else:
+                isatab_path = source
+            try:
+                dataset = load_dataset_from_isatab(Path(isatab_path), validate=False)
+                agent.dataset = dataset
+            except Exception:
+                pass  # dataset dir may have moved; user can re-load
 
     console.print(f"\n[bold]Session: {session.name or session.id}[/bold]")
     console.print(
@@ -482,7 +499,9 @@ async def _analysis_chat(session_id: str) -> None:
 
         # --- General conversation: LLM decides what to do ---
 
-        result = await agent._chat_agent.run(user_input, deps=deps)
+        result = await agent._chat_agent.run(
+            user_input, deps=deps, message_history=deps.message_history()
+        )
         chat_response = result.output
         response = chat_response.message
 
@@ -492,23 +511,29 @@ async def _analysis_chat(session_id: str) -> None:
                 console.print(
                     f"\n[yellow]Suggested: {tool_request.tool_name}[/yellow]"
                     f"\n  Reason: {tool_request.rationale}"
-                    f"\n  Params: {tool_request.suggested_params}"
+                    f"\n  Params: {tool_request.params_as_dict()}"
                 )
 
                 if typer.confirm("Run this tool?"):
-                    input_files = _resolve_inputs(agent, tool_request)
+                    input_files, parent_id = _resolve_inputs(
+                        agent, tool_request, user_input
+                    )
+                    from uuid import uuid4
+
+                    run_id = uuid4().hex[:8]
                     output_dir = (
                         config.home_dir
                         / "outputs"
                         / session.id
-                        / tool_request.tool_name
+                        / f"{tool_request.tool_name}_{run_id}"
                     )
 
                     entry, run_result = await agent.run_tool_with_logging(
                         tool_request.tool_name,
                         input_files,
                         output_dir,
-                        params=tool_request.suggested_params,
+                        params=tool_request.params_as_dict(),
+                        parent_id=parent_id,
                     )
 
                     if run_result.exit_code == 0:
@@ -517,10 +542,24 @@ async def _analysis_chat(session_id: str) -> None:
                             for f in entry.files
                             if f.role == "output"
                         ]
+                        # Read small output files so the LLM can discuss results
+                        output_snippets = []
+                        for f in entry.files:
+                            if f.role == "output":
+                                op = Path(f.path)
+                                if op.exists() and op.stat().st_size < 10_000:
+                                    try:
+                                        output_snippets.append(
+                                            f"--- {op.name} ---\n{op.read_text()}"
+                                        )
+                                    except Exception:
+                                        pass
                         response = (
                             f"{tool_request.tool_name} completed. "
                             f"Outputs: {outputs}"
                         )
+                        if output_snippets:
+                            response += "\n" + "\n".join(output_snippets)
                     else:
                         response = (
                             f"{tool_request.tool_name} failed "
@@ -550,21 +589,32 @@ async def _analysis_chat(session_id: str) -> None:
         store.append_message(session.id, session.chat_messages[-1])
 
 
-def _resolve_inputs(agent: "AnalysisForgeAgent", tool_request: "ToolRunRequest") -> dict[str, Path]:  # noqa: F821
+def _resolve_inputs(
+    agent: "AnalysisForgeAgent",  # noqa: F821
+    tool_request: "ToolRunRequest",  # noqa: F821
+    user_input: str = "",
+) -> tuple[dict[str, Path], str | None]:
     """Resolve input file paths from tool request mapping.
 
     Resolution order for each input_name -> source:
       1. Literal file path (if exists on disk)
       2. Match against prior session output files (by filename or substring)
       3. Match against dataset files (by filename, format, or substring)
+      4. Search ISA-Tab directory for structural files
+
+    Returns:
+        (input_files, parent_id) — parent_id is set only when an input
+        was resolved from a prior tool run's output (real data dependency).
 
     Raises ValueError if any required input cannot be resolved.
     """
     from bioledger.ledger.models import EntryKind
 
     input_files: dict[str, Path] = {}
+    parent_id: str | None = None
+    mapping = tool_request.mapping_as_dict()
 
-    for input_name, source in tool_request.input_mapping.items():
+    for input_name, source in mapping.items():
         resolved = None
 
         # 1. Literal path
@@ -581,11 +631,12 @@ def _resolve_inputs(agent: "AnalysisForgeAgent", tool_request: "ToolRunRequest")
                             fp = Path(f.path)
                             if fp.name == source or source in str(fp):
                                 resolved = fp
+                                parent_id = entry.id
                                 break
                 if resolved:
                     break
 
-        # 3. Search dataset files
+        # 3. Search dataset files (assay data files)
         if resolved is None and agent.dataset:
             for f in agent.dataset.files:
                 loc = f.downloaded_path or f.location
@@ -595,6 +646,13 @@ def _resolve_inputs(agent: "AnalysisForgeAgent", tool_request: "ToolRunRequest")
                         resolved = lp
                         break
 
+        # 4. Search ISA-Tab directory for structural files
+        #    (s_study.txt, a_assay.txt, i_investigation.txt, etc.)
+        if resolved is None and agent.dataset and agent.dataset.isa_tab_dir:
+            candidate = agent.dataset.isa_tab_dir / source
+            if candidate.exists():
+                resolved = candidate
+
         if resolved is None:
             raise ValueError(
                 f"Cannot resolve input '{input_name}' from source '{source}'. "
@@ -603,7 +661,7 @@ def _resolve_inputs(agent: "AnalysisForgeAgent", tool_request: "ToolRunRequest")
             )
         input_files[input_name] = resolved
 
-    return input_files
+    return input_files, parent_id
 
 
 # --- Crystallize ---
