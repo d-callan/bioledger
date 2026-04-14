@@ -5,7 +5,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
+from pydantic_ai import RunContext
 
 from bioledger.config import BioLedgerConfig
 from bioledger.core.llm.agents import ForgeDeps, make_agent
@@ -22,13 +23,33 @@ from bioledger.ledger.store import LedgerStore
 from bioledger.toolspec.store import ToolStore
 
 
+class KeyValuePair(BaseModel):
+    """A single key-value pair. Used instead of dict to avoid
+    Gemini's additionalProperties limitation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    key: str
+    value: str
+
+
 class ToolRunRequest(BaseModel):
     """LLM-structured request to run a tool."""
 
+    model_config = ConfigDict(extra="forbid")
+
     tool_name: str
     rationale: str  # why this tool for this step
-    suggested_params: dict[str, Any] = {}
-    input_mapping: dict[str, str] = {}  # tool_input_name → file path or prior output ref
+    suggested_params: list[KeyValuePair] = []
+    input_mapping: list[KeyValuePair] = []  # tool_input_name → file path or prior output ref
+
+    def params_as_dict(self) -> dict[str, str]:
+        """Convert suggested_params list back to a dict."""
+        return {kv.key: kv.value for kv in self.suggested_params}
+
+    def mapping_as_dict(self) -> dict[str, str]:
+        """Convert input_mapping list back to a dict."""
+        return {kv.key: kv.value for kv in self.input_mapping}
 
 
 class ChatIntent(str, Enum):
@@ -78,6 +99,16 @@ class AnalysisForgeAgent:
         self.tool_store = ToolStore()
         self.dataset: DataSet | None = None
 
+        # Build dynamic tool list for the system prompt
+        available_tools = self.tool_store.list_all()
+        if available_tools:
+            tools_list = "\n".join(
+                f"- {t.name}: {t.execution.description or 'No description'}"
+                for t in available_tools
+            )
+        else:
+            tools_list = "(No tools available - import tools with 'bioledger tool import')"
+
         # Main conversational agent — structured output with explicit intent
         self._chat_agent = make_agent(
             config,
@@ -89,17 +120,55 @@ class AnalysisForgeAgent:
                 "run bioinformatics tools, and package results into "
                 "reproducible RO-Crates.\n\n"
                 "When the user loads a dataset, summarize what you see and "
-                "suggest a workflow. Always confirm tool runs before executing. "
+                "suggest a workflow. "
                 "After each tool run, report results and suggest next steps. "
+                "When the user asks about results from a tool run, use the "
+                "fetch_entry_outputs tool to get the actual output — never guess. "
                 "When the user wants to package results, help them review and "
                 "select entries.\n\n"
-                "IMPORTANT: Set intent='suggest_tool' and suggested_tool=<name> "
-                "ONLY when you believe a specific tool should be executed next. "
+                f"Available tools you can run:\n{tools_list}\n\n"
+                "IMPORTANT: When the user asks to run a tool, immediately set "
+                "intent='suggest_tool' and suggested_tool=<name>. "
+                "Do NOT ask the user to confirm — confirmation is handled "
+                "separately by the system. "
                 "Use intent='respond' for all other conversational replies. "
                 "Use intent='clarify' when you need more info."
             ),
             output_type=ChatResponse,
         )
+
+        # On-demand tool: LLM calls this to fetch output content for a
+        # specific entry ID rather than having all outputs in context.
+        @self._chat_agent.tool
+        def fetch_entry_outputs(ctx: RunContext[ForgeDeps], entry_id: str) -> str:
+            """Fetch output file contents for a tool/script run entry.
+            Use this whenever the user asks about results from a specific run.
+            Pass the entry ID (shown in review output or tool run messages)."""
+            for entry in ctx.deps.session.entries:
+                if entry.id == entry_id:
+                    if entry.kind not in (EntryKind.TOOL_RUN, EntryKind.SCRIPT_RUN):
+                        return f"Entry {entry_id} is a {entry.kind.value}, not a tool/script run."
+                    snippets: list[str] = []
+                    for f in entry.files:
+                        if f.role == "output":
+                            p = Path(f.path)
+                            if p.exists() and p.stat().st_size < 50_000:
+                                try:
+                                    snippets.append(f"--- {p.name} ---\n{p.read_text()}")
+                                except Exception:
+                                    snippets.append(f"--- {p.name} --- (unreadable)")
+                            elif p.exists():
+                                size = p.stat().st_size
+                                snippets.append(
+                                    f"--- {p.name} --- ({size} bytes, too large to display)"
+                                )
+                            else:
+                                snippets.append(f"--- {p.name} --- (file not found)")
+                    if not snippets:
+                        return f"Entry {entry_id} ({entry.tool_spec_name}) has no output files."
+                    header = f"Outputs for {entry.tool_spec_name} run {entry_id}:"
+                    return header + "\n\n" + "\n\n".join(snippets)
+            return f"No entry found with ID '{entry_id}'."
 
         # Tool selection agent — structured output
         self._tool_select_agent = make_agent(
@@ -205,9 +274,18 @@ class AnalysisForgeAgent:
         )
 
         available_tools = self.tool_store.list_all()
-        tools_summary = "\n".join(
-            f"- {t.name}: {t.execution.description}" for t in available_tools
-        )
+
+        # Build detailed tool info including input requirements
+        tools_details = []
+        for t in available_tools:
+            inputs_info = ""
+            if t.execution.inputs:
+                inputs_info = "\n    Inputs: " + ", ".join(
+                    f"{name} ({inp.format}, required={inp.required})"
+                    for name, inp in t.execution.inputs.items()
+                )
+            tools_details.append(f"- {t.name}: {t.execution.description}{inputs_info}")
+        tools_summary = "\n".join(tools_details)
 
         # Recent outputs from last tool run
         last_outputs: list[str] = []
@@ -216,16 +294,31 @@ class AnalysisForgeAgent:
                 last_outputs = [f.path for f in entry.files if f.role == "output"]
                 break
 
+        # Available files from dataset
+        dataset_files: list[str] = []
+        if self.dataset:
+            for f in self.dataset.files:
+                loc = f.downloaded_path or f.location
+                dataset_files.append(f"{Path(loc).name} (format: {f.format})")
+
         context = (
             f"User request: {user_message}\n\n"
             f"Dataset: {self.dataset.name if self.dataset else 'none'}\n"
             f"Assay type: {self.dataset.assay_type if self.dataset else 'unknown'}\n"
             f"File formats: "
-            f"{', '.join(self.dataset.file_formats) if self.dataset else 'unknown'}\n\n"
+            f"{', '.join(self.dataset.file_formats) if self.dataset else 'unknown'}\n"
+            f"Dataset files: {dataset_files if dataset_files else 'none loaded'}\n\n"
             f"Session history ({len(self.session.entries)} entries):\n"
             f"{self._session_summary()}\n\n"
             f"Last outputs: {last_outputs}\n\n"
-            f"Available tools:\n{tools_summary}\n"
+            f"Available tools:\n{tools_summary}\n\n"
+            f"IMPORTANT: When suggesting a tool, you MUST populate input_mapping "
+            f"with the tool's required inputs mapped to available files. "
+            f"Each entry is a KeyValuePair with 'key' (the tool input name) "
+            f"and 'value' (the filename). For example, if the tool has input "
+            f"'input_file' and the user mentioned 's_study.txt', set "
+            f"input_mapping=[{{'key': 'input_file', 'value': 's_study.txt'}}]. "
+            f"Use filenames from the dataset files list above."
         )
         result = await self._tool_select_agent.run(context, deps=deps)
         return result.output
@@ -240,13 +333,6 @@ class AnalysisForgeAgent:
     ) -> tuple[LedgerEntry, Any]:
         """Run a tool and log everything to the session."""
         spec = self.tool_store.load(tool_name)
-
-        # Auto-chain: if no parent_id, link to last tool_run entry
-        if parent_id is None:
-            for entry in reversed(self.session.entries):
-                if entry.kind in (EntryKind.TOOL_RUN, EntryKind.SCRIPT_RUN):
-                    parent_id = entry.id
-                    break
 
         entry, result = run_tool(
             self.session,
