@@ -55,10 +55,10 @@ Study Factor Type Term Accession Number
 Study Factor Type Term Source REF
 STUDY ASSAYS
 Study Assay File Name	a_assay.txt
-Study Assay Measurement Type	sample metadata analysis
+Study Assay Measurement Type	nucleotide sequencing data analysis
 Study Assay Measurement Type Term Accession Number	
 Study Assay Measurement Type Term Source REF	
-Study Assay Technology Type	metadata collection
+Study Assay Technology Type	nucleotide sequencing
 Study Assay Technology Type Term Accession Number	
 Study Assay Technology Type Term Source REF	
 Study Assay Technology Platform	

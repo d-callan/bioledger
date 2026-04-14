@@ -5,14 +5,11 @@ execution:
   description: "Count lines in a text file (including header if present)"
   container: "python:3.11-slim"
   command: >-
-    python -c "
-    import json, sys;
-    with open('/data/input/{{inputs.input_file}}') as f:
-        lines = f.readlines();
-    result = {'file': '{{inputs.input_file}}', 'line_count': len(lines)};
-    json.dump(result, open('/data/output/summary.json', 'w'), indent=2);
-    print(f'Counted {len(lines)} lines')
-    "
+    python -c
+    "import json; lines=open('{{inputs.input_file}}').readlines();
+    result={'file':'{{inputs.input_file}}','line_count':len(lines)};
+    json.dump(result,open('{{outputs._dir}}/summary.json','w'),indent=2);
+    print(f'Counted {len(lines)} lines')"
   inputs:
     input_file:
       type: file
