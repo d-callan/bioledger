@@ -267,6 +267,8 @@ def load_dataset_from_isatab(isa_dir: Path, validate: bool = True) -> DataSet:
 
     from .validate import validate_isatab
 
+    isa_dir = isa_dir.resolve()
+
     # Validate first
     if validate:
         result = validate_isatab(isa_dir)
@@ -297,10 +299,25 @@ def load_dataset_from_isatab(isa_dir: Path, validate: bool = True) -> DataSet:
             study.assays[0].technology_type.term if study.assays[0].technology_type else ""
         )
 
-    # Extract files
+    # Extract files — both ISA-Tab structural files and assay data files
     files: list[DataFile] = []
     seen_formats: set[str] = set()
     file_formats: list[str] = []
+
+    # Include ISA-Tab structural files (investigation, study, assay tables)
+    for isa_file in sorted(isa_dir.glob("*.txt")):
+        if isa_file.is_file():
+            fmt = _infer_format(isa_file.name)
+            if fmt not in seen_formats:
+                seen_formats.add(fmt)
+                file_formats.append(fmt)
+            files.append(
+                DataFile(
+                    location=str(isa_file),
+                    format=fmt,
+                    is_remote=False,
+                )
+            )
 
     for assay in study.assays:
         for df in assay.data_files:
