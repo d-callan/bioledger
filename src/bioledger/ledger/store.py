@@ -6,7 +6,7 @@ from pathlib import Path
 
 from .models import ChatMessage, LedgerEntry, LedgerSession
 
-SCHEMA_VERSION = 1  # bump when schema changes
+SCHEMA_VERSION = 2  # bump when schema changes
 
 _SCHEMA_V1 = """\
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -40,11 +40,14 @@ CREATE TABLE IF NOT EXISTS chat_messages (
 );
 CREATE INDEX IF NOT EXISTS idx_entries_session ON entries(session_id);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON chat_messages(session_id);
+-- Unique names: multiple unnamed sessions allowed, named must be unique
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_name ON sessions(name) WHERE name != '';
 """
 
 # Sequential migrations: version N → N+1
 _MIGRATIONS: dict[int, str] = {
-    # 1: "ALTER TABLE sessions ADD COLUMN tags TEXT DEFAULT '';",
+    # 2: Enforce unique session names (unnamed sessions still allowed)
+    2: "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_name ON sessions(name) WHERE name != '';",
 }
 
 
@@ -90,20 +93,29 @@ class LedgerStore:
         _run_migrations(self._conn)
 
     def create_session(self, session: LedgerSession) -> None:
-        """Create a new session (no entries yet)."""
-        self._conn.execute(
-            "INSERT INTO sessions (id, name, description, status, created, updated) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (
-                session.id,
-                session.name,
-                session.description,
-                session.status.value,
-                session.created.isoformat(),
-                session.updated.isoformat(),
-            ),
-        )
-        self._conn.commit()
+        """Create a new session (no entries yet).
+
+        Raises:
+            ValueError: if a session with this name already exists (and name is not empty)
+        """
+        try:
+            self._conn.execute(
+                "INSERT INTO sessions (id, name, description, status, created, updated) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    session.id,
+                    session.name,
+                    session.description,
+                    session.status.value,
+                    session.created.isoformat(),
+                    session.updated.isoformat(),
+                ),
+            )
+            self._conn.commit()
+        except sqlite3.IntegrityError as e:
+            if "UNIQUE constraint failed" in str(e) and session.name:
+                raise ValueError(f"Session name '{session.name}' is already in use") from e
+            raise
 
     def append_entry(self, session_id: str, entry: LedgerEntry) -> None:
         """Append a single entry to a session. Atomic."""
@@ -160,8 +172,47 @@ class LedgerStore:
         ).fetchone()
         if not row:
             raise KeyError(f"Session '{session_id}' not found")
+        return self._hydrate_session(row, include_messages, max_entries, max_messages)
+
+    def load_session_by_name(
+        self,
+        name: str,
+        include_messages: bool = True,
+        max_entries: int | None = None,
+        max_messages: int | None = None,
+    ) -> LedgerSession:
+        """Load a session by its unique name.
+
+        Raises:
+            KeyError: if no session with this name exists
+            RuntimeError: if multiple sessions share this name (data integrity issue)
+        """
+        rows = self._conn.execute(
+            "SELECT id, name, description, status, created, updated "
+            "FROM sessions WHERE name = ? AND status != 'archived'",
+            (name,),
+        ).fetchall()
+        if not rows:
+            raise KeyError(f"Session named '{name}' not found")
+        if len(rows) > 1:
+            ids = [r[0] for r in rows]
+            raise RuntimeError(
+                f"Multiple sessions named '{name}' found: {ids}. "
+                "This should not happen with unique names."
+            )
+        return self._hydrate_session(rows[0], include_messages, max_entries, max_messages)
+
+    def _hydrate_session(
+        self,
+        row: tuple,
+        include_messages: bool,
+        max_entries: int | None,
+        max_messages: int | None,
+    ) -> LedgerSession:
+        """Build a LedgerSession from a DB row and load its entries/messages."""
+        session_id = row[0]
         session = LedgerSession(
-            id=row[0],
+            id=session_id,
             name=row[1],
             description=row[2],
             status=row[3],
@@ -240,12 +291,21 @@ class LedgerStore:
         ]
 
     def rename_session(self, session_id: str, name: str) -> None:
-        """Rename a session."""
-        self._conn.execute(
-            "UPDATE sessions SET name = ? WHERE id = ?", (name, session_id)
-        )
-        self._touch_session(session_id)
-        self._conn.commit()
+        """Rename a session.
+
+        Raises:
+            ValueError: if another session already uses this name
+        """
+        try:
+            self._conn.execute(
+                "UPDATE sessions SET name = ? WHERE id = ?", (name, session_id)
+            )
+            self._touch_session(session_id)
+            self._conn.commit()
+        except sqlite3.IntegrityError as e:
+            if "UNIQUE constraint failed" in str(e) and name:
+                raise ValueError(f"Session name '{name}' is already in use") from e
+            raise
 
     def update_session_description(self, session_id: str, description: str) -> None:
         """Update a session's description."""

@@ -28,13 +28,17 @@ console = Console()
 
 @session_app.command("new")
 def session_new(
-    name: str = typer.Option("", help="Session name"),
+    name: str = typer.Option("", help="Session name (must be unique if provided)"),
     description: str = typer.Option("", help="What this analysis is about"),
 ) -> None:
     """Create a new analysis session."""
     session = LedgerSession(name=name, description=description)
     store = LedgerStore()
-    store.create_session(session)
+    try:
+        store.create_session(session)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
     console.print(f"[green]Session {session.id} created[/green]")
     if name:
         console.print(f"  Name: {name}")
@@ -105,7 +109,11 @@ def session_show(session_id: str) -> None:
 def session_rename(session_id: str, name: str) -> None:
     """Rename a session."""
     store = LedgerStore()
-    store.rename_session(session_id, name)
+    try:
+        store.rename_session(session_id, name)
+    except ValueError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(1)
     console.print(f"[green]Session {session_id} renamed to '{name}'[/green]")
 
 
@@ -314,9 +322,23 @@ def tool_export(
 
 
 @app.command()
-def resume(session_id: str) -> None:
-    """Resume an interactive analysis session (chat mode)."""
-    asyncio.run(_analysis_chat(session_id))
+def resume(session_ref: str) -> None:
+    """Resume an interactive analysis session (chat mode).
+
+    Accepts either a session ID or a unique session name.
+    """
+    store = LedgerStore()
+    # Try ID first, fall back to name lookup
+    try:
+        session = store.load_session(session_ref)
+    except KeyError:
+        try:
+            session = store.load_session_by_name(session_ref)
+        except KeyError:
+            console.print(f"[red]Session '{session_ref}' not found by ID or name[/red]")
+            raise typer.Exit(1)
+    # Pass the resolved session ID to the chat handler
+    asyncio.run(_analysis_chat(session.id))
 
 
 async def _analysis_chat(session_id: str) -> None:

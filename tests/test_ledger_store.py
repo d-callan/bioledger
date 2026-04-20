@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from bioledger.ledger.models import (
     ChatMessage,
     EntryKind,
@@ -134,3 +136,70 @@ def test_load_session_without_messages(tmp_db_path):
 
     loaded = store.load_session(session.id, include_messages=False)
     assert len(loaded.chat_messages) == 0
+
+
+def test_load_session_by_name(tmp_db_path):
+    """Session lookup by unique name should work."""
+    store = LedgerStore(db_path=tmp_db_path)
+    session = LedgerSession(name="my-test-session", description="Named session")
+    store.create_session(session)
+
+    loaded = store.load_session_by_name("my-test-session")
+    assert loaded.id == session.id
+    assert loaded.name == "my-test-session"
+
+
+def test_load_session_by_name_not_found(tmp_db_path):
+    """Lookup by non-existent name should raise KeyError."""
+    store = LedgerStore(db_path=tmp_db_path)
+    with pytest.raises(KeyError, match="not found"):
+        store.load_session_by_name("non-existent-session")
+
+
+def test_duplicate_session_name_rejected_on_create(tmp_db_path):
+    """Duplicate session names should be rejected."""
+    store = LedgerStore(db_path=tmp_db_path)
+    s1 = LedgerSession(name="unique-name")
+    store.create_session(s1)
+
+    s2 = LedgerSession(name="unique-name")
+    with pytest.raises(ValueError, match="already in use"):
+        store.create_session(s2)
+
+
+def test_duplicate_session_name_rejected_on_rename(tmp_db_path):
+    """Renaming to an existing name should be rejected."""
+    store = LedgerStore(db_path=tmp_db_path)
+    s1 = LedgerSession(name="first")
+    s2 = LedgerSession(name="second")
+    store.create_session(s1)
+    store.create_session(s2)
+
+    with pytest.raises(ValueError, match="already in use"):
+        store.rename_session(s2.id, "first")
+
+
+def test_multiple_unnamed_sessions_allowed(tmp_db_path):
+    """Multiple sessions without names should be allowed."""
+    store = LedgerStore(db_path=tmp_db_path)
+    s1 = LedgerSession(name="")  # unnamed
+    s2 = LedgerSession(name="")  # also unnamed
+    store.create_session(s1)
+    store.create_session(s2)
+
+    # Both should exist
+    loaded1 = store.load_session(s1.id)
+    loaded2 = store.load_session(s2.id)
+    assert loaded1.name == ""
+    assert loaded2.name == ""
+
+
+def test_archived_session_excluded_from_name_lookup(tmp_db_path):
+    """Archived sessions should not be found by name lookup."""
+    store = LedgerStore(db_path=tmp_db_path)
+    session = LedgerSession(name="to-be-archived")
+    store.create_session(session)
+    store.archive_session(session.id)
+
+    with pytest.raises(KeyError, match="not found"):
+        store.load_session_by_name("to-be-archived")
