@@ -142,11 +142,37 @@ The crate at `~/.bioledger/crates/a1b2c3d4/` now contains:
 
 - `ro-crate-metadata.json` — full provenance graph
 - `workflow.nf` — crystallized Nextflow workflow
+- `nextflow.config` — Docker configuration for reproducible runs
 - `ledger.json` — raw ledger entries
 - ISA-Tab files (`i_investigation.txt`, `s_study.txt`, `a_assay.txt`)
 - Tool output (`summary.json`)
 
-## What just happened?
+### 6.1 Validate the packaged workflow
+
+Run the workflow from the crate to verify everything works:
+
+```bash
+cd ~/.bioledger/crates/a1b2c3d4
+nextflow run workflow.nf
+```
+
+Expected output:
+
+```
+executor >  local (1)
+[xx/xxxxxx] process > LINE_COUNTER [100%] 1 of 1 ✔
+```
+
+Check the reproduced results:
+
+```bash
+cat results/LINE_COUNTER/summary.json
+# {"file": "s_study.txt", "line_count": 4}
+```
+
+The workflow runs each tool in its original container (configured via `nextflow.config`), and `publishDir` ensures results land in `results/` for easy inspection. This validates that the crate captures a fully reproducible analysis.
+
+## 7. What just happened?
 
 You went from an ISA-Tab dataset to a reproducible, packaged analysis without ever writing workflow syntax:
 
