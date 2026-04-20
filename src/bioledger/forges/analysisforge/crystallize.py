@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import logging
 from collections import defaultdict
+from pathlib import Path
+
+from jinja2 import Template
 
 from bioledger.ledger.models import EntryKind, LedgerEntry, LedgerSession
 
@@ -53,115 +56,194 @@ def _proc_name(entry: LedgerEntry, index: int) -> str:
     return f"step_{index}_{base}".replace("-", "_")
 
 
+def _input_name_to_filename(entry: LedgerEntry) -> dict[str, str]:
+    """Extract mapping of tool input name -> filename from the entry.
+
+    Uses container.volumes bindings (host_path -> /input/{name}) cross-referenced
+    with entry.files (role=='input') to recover the tool-input-name -> filename
+    mapping that was used at execution time.
+    """
+    mapping: dict[str, str] = {}
+    if not entry.container or not entry.container.volumes:
+        return mapping
+    input_file_paths = {
+        Path(f.path).resolve(): Path(f.path).name
+        for f in entry.files
+        if f.role == "input"
+    }
+    for host_path, bind_path in entry.container.volumes.items():
+        if not bind_path.startswith("/input/"):
+            continue
+        name = bind_path.removeprefix("/input/").split("/", 1)[0]
+        host_dir = Path(host_path).resolve()
+        for abs_path, filename in input_file_paths.items():
+            if abs_path.parent == host_dir:
+                mapping[name] = filename
+                break
+    return mapping
+
+
+def _output_filenames(entry: LedgerEntry) -> list[str]:
+    """Return output filenames captured during the run."""
+    return [Path(f.path).name for f in entry.files if f.role == "output"]
+
+
+def _render_script_for_nextflow(entry: LedgerEntry, input_names: list[str]) -> str:
+    """Re-render the tool spec command template with Nextflow-style variables.
+
+    In Nextflow, declared `path <name>` inputs are staged into the work dir with
+    their original filename and are referenced as the bash variable ``${name}``.
+    Output files in the work dir (``.``) are captured by the output declaration.
+    """
+    spec = entry.tool_spec_snapshot or {}
+    template_str = spec.get("command")
+    if not template_str:
+        if entry.container and entry.container.command:
+            return " ".join(entry.container.command)
+        return "echo 'no command'"
+    # Jinja context: inputs use Nextflow shell variables; output dir is '.'
+    context = {
+        "inputs": {name: f"${{{name}}}" for name in input_names},
+        "outputs": {"_dir": "."},
+        "parameters": {
+            k: v.get("default")
+            for k, v in (spec.get("parameters") or {}).items()
+        },
+    }
+    try:
+        return Template(template_str).render(context)
+    except Exception:
+        logger.warning("Failed to render Nextflow script for %s", entry.id)
+        if entry.container and entry.container.command:
+            return " ".join(entry.container.command)
+        return "echo 'render failed'"
+
+
 def _make_nf_process(proc: str, entry: LedgerEntry) -> str:
     """Build a single Nextflow process block from a ledger entry."""
     image = entry.container.image if entry.container else "ubuntu:latest"
-    cmd = " ".join(entry.container.command) if entry.container else "echo 'no command'"
+    spec = entry.tool_spec_snapshot or {}
+
+    # Input names: prefer the tool spec's declared inputs; fall back to the
+    # recovered mapping from container volumes.
+    spec_inputs = spec.get("inputs") or {}
+    input_map = _input_name_to_filename(entry)
+    input_names = list(spec_inputs.keys()) or list(input_map.keys())
+    if not input_names:
+        input_decls = ["    path input"]
+    else:
+        input_decls = [f"    path {name}" for name in input_names]
+
+    # Output declarations: prefer concrete filenames from the recorded run;
+    # fall back to tool spec patterns.
+    output_files = _output_filenames(entry)
+    if output_files:
+        output_decls = [f"    path '{f}'" for f in output_files]
+    else:
+        output_decls = []
+        for out_def in (spec.get("outputs") or {}).values():
+            pattern = out_def.get("pattern") or f"*.{out_def.get('format', 'out')}"
+            output_decls.append(f"    path '{pattern}'")
+        if not output_decls:
+            output_decls = ["    path '*'"]
+
+    script = _render_script_for_nextflow(entry, input_names)
+
     return f"""
 process {proc} {{
     container '{image}'
+    publishDir "results/{proc}", mode: 'copy'
 
     input:
-    path input_files
+{chr(10).join(input_decls)}
 
     output:
-    path '*'
+{chr(10).join(output_decls)}
 
     script:
     \"\"\"
-    {cmd}
+    {script}
     \"\"\"
 }}"""
 
 
-def to_nextflow(session: LedgerSession) -> str:
-    """Convert a ledger session into a DAG-aware Nextflow DSL2 workflow."""
-    children, by_id = _build_dag(session)
-    ordered = _topological_order(children)
+def _crate_input_channels(entry: LedgerEntry) -> list[str]:
+    """Build Nextflow channel expressions for an entry's inputs, referencing
+    their location within the packaged RO-Crate.
 
+    The crate layout places each entry's files at ``{entry_id[:8]}/{filename}``
+    relative to the crate root (where ``workflow.nf`` lives).
+    """
+    spec_inputs = (entry.tool_spec_snapshot or {}).get("inputs") or {}
+    input_map = _input_name_to_filename(entry)
+    ordered_names = list(spec_inputs.keys()) or list(input_map.keys())
+    crate_dir = entry.id[:8]
+    channels: list[str] = []
+    for name in ordered_names:
+        filename = input_map.get(name)
+        if filename:
+            channels.append(
+                f'Channel.fromPath("${{projectDir}}/{crate_dir}/{filename}")'
+            )
+        else:
+            channels.append("Channel.fromPath(params.input)")
+    if not channels:
+        # No declared inputs — fall back to a single generic channel so the
+        # process can still be wired.
+        channels.append("Channel.fromPath(params.input)")
+    return channels
+
+
+def _render_workflow(ordered: list[LedgerEntry]) -> str:
+    """Shared renderer: emit process blocks + workflow block for ordered entries.
+
+    Root entries (parent not in selection) reference their specific input files
+    from within the packaged RO-Crate. Chained entries consume their parent's
+    output channel.
+    """
     if not ordered:
-        return "// Empty workflow — no tool or script runs in session"
+        return "// Empty workflow — no tool or script runs in selection"
 
     entry_to_proc: dict[str, str] = {}
     processes: list[str] = []
-    workflow_lines: list[str] = [
-        "workflow {",
-        "    ch_input = Channel.fromPath(params.input)",
-    ]
+    workflow_lines: list[str] = ["workflow {"]
 
     for i, entry in enumerate(ordered):
         proc = _proc_name(entry, i)
         entry_to_proc[entry.id] = proc
         processes.append(_make_nf_process(proc, entry))
 
-        # Wire inputs: root entries get ch_input, others get parent's output
-        if entry.parent_id is None or entry.parent_id not in entry_to_proc:
-            workflow_lines.append(f"    {proc}(ch_input)")
-        else:
+        if entry.parent_id and entry.parent_id in entry_to_proc:
             parent_proc = entry_to_proc[entry.parent_id]
             workflow_lines.append(f"    {proc}({parent_proc}.out)")
+        else:
+            # Root entry: wire to its specific input files from the crate
+            channels = _crate_input_channels(entry)
+            workflow_lines.append(f"    {proc}({', '.join(channels)})")
 
     workflow_lines.append("}")
     return "\n".join(processes) + "\n\n" + "\n".join(workflow_lines)
 
 
+def to_nextflow(session: LedgerSession) -> str:
+    """Convert a ledger session into a DAG-aware Nextflow DSL2 workflow."""
+    children, _by_id = _build_dag(session)
+    ordered = _topological_order(children)
+    return _render_workflow(ordered)
+
+
 def to_nextflow_from_entries(entries: list[LedgerEntry]) -> str:
-    """Generate a Nextflow DSL2 workflow from a list of entries (not a full session).
+    """Generate a Nextflow DSL2 workflow from a list of entries.
 
-    Used by build_rocrate when user selects specific entries to package.
-    Builds DAG from the provided entries only, treating entries whose
-    parent_id is not in the subset as root entries.
-
-    Returns:
-        Nextflow DSL2 workflow string. Includes a comment warning if the
-        selection contains disconnected subgraphs (multiple roots).
+    Used by build_rocrate when packaging selected entries. Entries whose
+    parent_id is not in the subset are treated as roots — their inputs are
+    read from the packaged crate layout. Multiple roots represent independent
+    parallel branches, which is a valid Nextflow pattern.
     """
     tool_entries = [
         e for e in entries if e.kind in (EntryKind.TOOL_RUN, EntryKind.SCRIPT_RUN)
     ]
-    if not tool_entries:
-        return "// Empty workflow — no tool or script runs in selection"
-
-    entry_to_proc: dict[str, str] = {}
-    root_entries: list[LedgerEntry] = []
-    processes: list[str] = []
-    workflow_lines: list[str] = [
-        "workflow {",
-        "    ch_input = Channel.fromPath(params.input)",
-    ]
-
-    for i, entry in enumerate(tool_entries):
-        proc = _proc_name(entry, i)
-        entry_to_proc[entry.id] = proc
-        processes.append(_make_nf_process(proc, entry))
-
-        # Wire: if parent is in the subset, chain; otherwise treat as root
-        if entry.parent_id and entry.parent_id in entry_to_proc:
-            parent_proc = entry_to_proc[entry.parent_id]
-            workflow_lines.append(f"    {proc}({parent_proc}.out)")
-        else:
-            root_entries.append(entry)
-            workflow_lines.append(f"    {proc}(ch_input)")
-
-    workflow_lines.append("}")
-
-    # Warn about disconnected subgraphs
-    header_comments: list[str] = []
-    if len(root_entries) > 1:
-        root_names = [entry_to_proc[e.id] for e in root_entries]
-        logger.warning(
-            "Selected entries form %d disconnected subgraphs (roots: %s). "
-            "The generated workflow may not represent a single linear pipeline.",
-            len(root_entries),
-            root_names,
-        )
-        header_comments.append(
-            f"// WARNING: {len(root_entries)} disconnected subgraphs detected.\n"
-            f"// Roots: {', '.join(root_names)}\n"
-            f"// This may indicate a non-contiguous selection of entries.\n"
-        )
-
-    return "\n".join(header_comments + processes) + "\n\n" + "\n".join(workflow_lines)
+    return _render_workflow(tool_entries)
 
 
 def to_galaxy_workflow(session: LedgerSession) -> dict:

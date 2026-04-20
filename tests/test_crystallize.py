@@ -88,12 +88,18 @@ def test_to_nextflow_from_entries_empty():
     assert "Empty workflow" in result
 
 
-def test_to_nextflow_from_entries_disconnected():
+def test_to_nextflow_from_entries_independent_roots():
+    """Multiple independent roots represent parallel branches — valid, not a warning."""
     e1 = _make_entry(tool_name="fastqc")
     e2 = _make_entry(tool_name="hisat2")  # no parent — second root
     result = to_nextflow_from_entries([e1, e2])
-    assert "WARNING" in result
-    assert "disconnected" in result.lower()
+    assert "process step_0_fastqc" in result
+    assert "process step_1_hisat2" in result
+    # Neither process should chain to the other
+    assert "step_0_fastqc.out" not in result
+    assert "step_1_hisat2.out" not in result
+    # No bogus warning about parallel independent runs
+    assert "WARNING" not in result
 
 
 def test_to_galaxy_workflow_empty():
