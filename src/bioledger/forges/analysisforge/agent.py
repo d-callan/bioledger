@@ -5,7 +5,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from pydantic_ai import RunContext
 
 from bioledger.config import BioLedgerConfig
@@ -24,8 +24,7 @@ from bioledger.toolspec.store import ToolStore
 
 
 class KeyValuePair(BaseModel):
-    """A single key-value pair. Used instead of dict to avoid
-    Gemini's additionalProperties limitation."""
+    """A single key-value pair (used in place of dict for LLM compatibility)."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -38,10 +37,36 @@ class ToolRunRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    tool_name: str
-    rationale: str  # why this tool for this step
-    suggested_params: list[KeyValuePair] = []
-    input_mapping: list[KeyValuePair] = []  # tool_input_name → file path or prior output ref
+    tool_name: str = Field(
+        description="Name of the tool to run (must match an available tool)."
+    )
+    rationale: str = Field(
+        description="Brief justification for choosing this tool."
+    )
+    suggested_params: list[KeyValuePair] = Field(
+        default_factory=list,
+        description=(
+            "Parameters to pass to the tool. Each KeyValuePair has "
+            "key=parameter_name, value=parameter_value."
+        ),
+    )
+    input_mapping: list[KeyValuePair] = Field(
+        default_factory=list,
+        description=(
+            "Maps each of the tool's declared inputs to a concrete source. "
+            "Each KeyValuePair has key=<tool input name> and value=<source>. "
+            "The source is resolved by the system in this order:\n"
+            "  1. Absolute/relative file path that exists on disk.\n"
+            "  2. Filename of a prior tool-run output in this session "
+            "(e.g. 'summary.json'). Most recent match wins.\n"
+            "  3. Filename, format, or substring from the loaded dataset "
+            "(e.g. 's_study.txt' or 'fastq').\n"
+            "  4. Filename inside the loaded ISA-Tab directory.\n"
+            "When multiple prior runs produced a file with the same name "
+            "and you need a specific one, prefix with the entry id: "
+            "'<entry_id_prefix>/<filename>' (e.g. '4fccaa48/summary.json')."
+        ),
+    )
 
     def params_as_dict(self) -> dict[str, str]:
         """Convert suggested_params list back to a dict."""
@@ -287,12 +312,19 @@ class AnalysisForgeAgent:
             tools_details.append(f"- {t.name}: {t.execution.description}{inputs_info}")
         tools_summary = "\n".join(tools_details)
 
-        # Recent outputs from last tool run
-        last_outputs: list[str] = []
+        # Recent tool/script outputs with their entry IDs (most recent first).
+        # The LLM uses these to chain tools: an output from run X can be an
+        # input to a later tool. When multiple entries share a filename, the
+        # LLM should disambiguate using '<entry_id>/<filename>' in the source.
+        prior_outputs: list[str] = []
         for entry in reversed(self.session.entries):
             if entry.kind in (EntryKind.TOOL_RUN, EntryKind.SCRIPT_RUN):
-                last_outputs = [f.path for f in entry.files if f.role == "output"]
-                break
+                for f in entry.files:
+                    if f.role == "output":
+                        prior_outputs.append(
+                            f"entry={entry.id} tool={entry.tool_spec_name} "
+                            f"file={Path(f.path).name}"
+                        )
 
         # Available files from dataset
         dataset_files: list[str] = []
@@ -301,6 +333,11 @@ class AnalysisForgeAgent:
                 loc = f.downloaded_path or f.location
                 dataset_files.append(f"{Path(loc).name} (format: {f.format})")
 
+        prior_outputs_text = (
+            "\n".join(f"  - {o}" for o in prior_outputs)
+            if prior_outputs
+            else "  (none yet)"
+        )
         context = (
             f"User request: {user_message}\n\n"
             f"Dataset: {self.dataset.name if self.dataset else 'none'}\n"
@@ -310,15 +347,9 @@ class AnalysisForgeAgent:
             f"Dataset files: {dataset_files if dataset_files else 'none loaded'}\n\n"
             f"Session history ({len(self.session.entries)} entries):\n"
             f"{self._session_summary()}\n\n"
-            f"Last outputs: {last_outputs}\n\n"
-            f"Available tools:\n{tools_summary}\n\n"
-            f"IMPORTANT: When suggesting a tool, you MUST populate input_mapping "
-            f"with the tool's required inputs mapped to available files. "
-            f"Each entry is a KeyValuePair with 'key' (the tool input name) "
-            f"and 'value' (the filename). For example, if the tool has input "
-            f"'input_file' and the user mentioned 's_study.txt', set "
-            f"input_mapping=[{{'key': 'input_file', 'value': 's_study.txt'}}]. "
-            f"Use filenames from the dataset files list above."
+            f"Prior tool-run outputs (available as inputs):\n"
+            f"{prior_outputs_text}\n\n"
+            f"Available tools:\n{tools_summary}\n"
         )
         result = await self._tool_select_agent.run(context, deps=deps)
         return result.output

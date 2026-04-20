@@ -617,22 +617,40 @@ def _resolve_inputs(
     for input_name, source in mapping.items():
         resolved = None
 
+        # 0. Disambiguation syntax: '<entry_id_prefix>/<filename>'
+        #    Lets the LLM target a specific prior tool run's output when
+        #    multiple runs produced files with the same name.
+        entry_prefix_hint: str | None = None
+        filename_hint: str = source
+        if "/" in source and not Path(source).exists():
+            maybe_prefix, maybe_name = source.split("/", 1)
+            # Treat as hint only if the prefix matches a known entry id
+            for e in agent.session.entries:
+                if e.id.startswith(maybe_prefix):
+                    entry_prefix_hint = maybe_prefix
+                    filename_hint = maybe_name
+                    break
+
         # 1. Literal path
         p = Path(source)
         if p.exists():
             resolved = p
 
-        # 2. Search prior session outputs (most recent first)
+        # 2. Search prior session outputs (most recent first).
+        #    When an entry_id prefix hint is given, only match that entry.
         if resolved is None:
             for entry in reversed(agent.session.entries):
-                if entry.kind in (EntryKind.TOOL_RUN, EntryKind.SCRIPT_RUN):
-                    for f in entry.files:
-                        if f.role == "output":
-                            fp = Path(f.path)
-                            if fp.name == source or source in str(fp):
-                                resolved = fp
-                                parent_id = entry.id
-                                break
+                if entry.kind not in (EntryKind.TOOL_RUN, EntryKind.SCRIPT_RUN):
+                    continue
+                if entry_prefix_hint and not entry.id.startswith(entry_prefix_hint):
+                    continue
+                for f in entry.files:
+                    if f.role == "output":
+                        fp = Path(f.path)
+                        if fp.name == filename_hint or filename_hint in str(fp):
+                            resolved = fp
+                            parent_id = entry.id
+                            break
                 if resolved:
                     break
 
