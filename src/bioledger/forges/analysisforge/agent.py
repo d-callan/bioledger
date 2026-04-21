@@ -351,7 +351,9 @@ class AnalysisForgeAgent:
             f"{prior_outputs_text}\n\n"
             f"Available tools:\n{tools_summary}\n"
         )
-        result = await self._tool_select_agent.run(context, deps=deps)
+        result = await self._tool_select_agent.run(
+            context, deps=deps, message_history=deps.message_history()
+        )
         return result.output
 
     async def run_tool_with_logging(
