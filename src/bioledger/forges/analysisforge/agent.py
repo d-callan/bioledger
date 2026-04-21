@@ -382,20 +382,26 @@ class AnalysisForgeAgent:
         for entry in self.session.entries:
             inputs = [f.path for f in entry.files if f.role == "input"]
             outputs = [f.path for f in entry.files if f.role == "output"]
-            summaries.append(
-                {
-                    "id": entry.id,
-                    "kind": entry.kind.value,
-                    "tool": entry.tool_spec_name or "",
-                    "timestamp": entry.timestamp.isoformat(),
-                    "inputs": inputs,
-                    "outputs": outputs,
-                    "params": entry.params,
-                    "exit_code": entry.exit_code,
-                    "notes": entry.notes,
-                    "parent_id": entry.parent_id,
-                }
-            )
+
+            # Build summary with all expected keys for consistent display
+            summary = {
+                "id": entry.id,
+                "kind": entry.kind.value,
+                "tool": entry.tool_spec_name or "",
+                "timestamp": entry.timestamp.isoformat(),
+                "inputs": inputs,
+                "outputs": outputs,
+                "params": entry.params,
+                "exit_code": entry.exit_code,
+                "notes": entry.notes or "",
+                "parent_id": entry.parent_id,
+            }
+
+            # For data imports, use a more descriptive label
+            if entry.kind == EntryKind.DATA_IMPORT and not summary["notes"]:
+                summary["notes"] = entry.params.get("summary", "Loaded dataset")
+
+            summaries.append(summary)
         return summaries
 
     def _session_summary(self) -> str:

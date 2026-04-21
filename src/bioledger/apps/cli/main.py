@@ -421,10 +421,13 @@ async def _analysis_chat(session_id: str) -> None:
                     if kind == "data_import"
                     else "[dim]NOTE[/dim]"
                 )
+                entry_id = e.get("id") or "[red]NO-ID[/red]"
+                label = e.get("tool") or e.get("notes", "")
+                outputs = e.get("outputs", [])
+                output_names = [Path(p).name for p in outputs]
                 console.print(
-                    f"  {icon} [{e['id']}] {e['kind']}: "
-                    f"{e['tool'] or e['notes']}  "
-                    f"outputs={[Path(p).name for p in e['outputs']]}"
+                    f"  {icon} [{entry_id}] {kind}: {label}  "
+                    f"outputs={output_names}"
                 )
             continue
 
@@ -437,9 +440,12 @@ async def _analysis_chat(session_id: str) -> None:
             )
             for e in entries:
                 if e["kind"] in ("tool_run", "script_run"):
+                    entry_id = e.get("id") or "[red]NO-ID[/red]"
+                    tool_name = e.get("tool", "unknown")
+                    outputs = e.get("outputs", [])
+                    output_names = [Path(p).name for p in outputs]
                     console.print(
-                        f"  [{e['id']}] {e['tool']} -> "
-                        f"{[Path(p).name for p in e['outputs']]}"
+                        f"  [{entry_id}] {tool_name} -> {output_names}"
                     )
 
             selection = console.input("[green]entries>[/green] ").strip()
