@@ -198,7 +198,7 @@ Tool specs are stored as YAML in `~/.bioledger/tools/` and use a two-layer model
 - **ExecutionSpec** — container, command template, inputs, outputs, parameters
 - **InterfaceSpec** (optional) — UI hints, conditionals, repeat blocks
 
-**Authoring a new tool?** See the full spec reference: [`src/bioledger/toolspec/TOOLSPEC.md`](src/bioledger/toolspec/TOOLSPEC.md). It documents every field, the command template variables, the container mount layout, validation rules, and the migration story.
+**Authoring a new tool?** See the full spec reference: [`src/bioledger/toolspec/README.md`](src/bioledger/toolspec/README.md). It documents every field, the command template variables, the container mount layout, validation rules, and the migration story.
 
 ---
 
